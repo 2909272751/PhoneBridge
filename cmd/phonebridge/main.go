@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 
 	"phonebridge/internal/app"
@@ -20,6 +22,7 @@ func main() {
 	var iceServerURLs string
 	var turnUsername string
 	var turnCredential string
+	var openBrowser bool
 
 	flag.StringVar(&listen, "listen", "127.0.0.1:8787", "HTTP 监听地址")
 	flag.BoolVar(&demo, "demo", false, "启用演示设备")
@@ -30,6 +33,7 @@ func main() {
 	flag.StringVar(&turnUsername, "turn-username", os.Getenv("PHONEBRIDGE_TURN_USERNAME"), "TURN 用户名")
 	flag.StringVar(&turnCredential, "turn-credential", os.Getenv("PHONEBRIDGE_TURN_CREDENTIAL"), "TURN 凭据")
 	flag.StringVar(&settingsPath, "settings", os.Getenv("PHONEBRIDGE_SETTINGS_PATH"), "PhoneBridge local settings file")
+	flag.BoolVar(&openBrowser, "open-browser", false, "start the local service and open PhoneBridge in the default browser")
 	flag.Parse()
 
 	var iceServers []app.ICEServerConfig
@@ -49,9 +53,23 @@ func main() {
 	}, logger)
 
 	logger.Printf("启动 PhoneBridge，访问 http://%s", listen)
+	if openBrowser {
+		openLocalPage(listen, logger)
+	}
 	if err := server.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "PhoneBridge 启动失败：%v\n", err)
 		os.Exit(1)
+	}
+}
+
+func openLocalPage(listen string, logger *log.Logger) {
+	url := "http://" + listen
+	if runtime.GOOS != "windows" {
+		logger.Printf("请在浏览器打开 %s", url)
+		return
+	}
+	if err := exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start(); err != nil {
+		logger.Printf("无法自动打开浏览器：%v；请手动访问 %s", err, url)
 	}
 }
 
