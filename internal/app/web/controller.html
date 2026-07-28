@@ -37,7 +37,7 @@
 
   <div class="controller-shell hidden" id="controller-shell">
     <header class="controller-topbar">
-      <div class="controller-brand"><strong>PhoneBridge</strong><span id="controller-device-name">Android设备</span></div>
+      <div class="controller-brand"><strong>PhoneBridge <small class="web-version">v1.0.0</small></strong><small class="mobile-transport" id="mobile-transport">传输 --</small><span id="controller-device-name">Android设备</span></div>
       <div class="connection-chips">
         <span class="connection-chip" id="connection-chip"><i></i>建立连接</span>
         <span class="latency-chip" id="latency-chip">演示</span>
@@ -45,10 +45,29 @@
       <div class="controller-actions">
         <span class="controller-countdown" id="controller-countdown">--:--</span>
         <select class="stream-profile" id="stream-profile" aria-label="视频分辨率与帧率">
-          <option value="auto">视频：自动</option>
           <option value="smooth">流畅：360p / 10fps</option>
-          <option value="quality">画质：960p / 24fps</option>
+          <option value="low">省流：480p / 15fps</option>
+          <option value="standard">均衡：540p / 18fps</option>
+          <option value="hd" selected>高清：720p / 24fps</option>
+          <option value="quality">高画质：960p / 24fps</option>
+          <option value="ultra">极清：1080p / 30fps</option>
+          <option value="custom">自定义组合…</option>
         </select>
+        <div class="custom-profile hidden" id="custom-profile" role="group" aria-label="自定义视频参数">
+          <label>分辨率
+            <select id="custom-size">
+              <option value="360">360p</option><option value="480">480p</option><option value="540">540p</option>
+              <option value="720" selected>720p</option><option value="960">960p</option><option value="1080">1080p</option>
+            </select>
+          </label>
+          <label>帧率
+            <select id="custom-fps">
+              <option value="10">10fps</option><option value="15">15fps</option><option value="18">18fps</option>
+              <option value="24" selected>24fps</option><option value="30">30fps</option>
+            </select>
+          </label>
+          <button type="button" id="apply-custom-profile">应用</button>
+        </div>
         <button class="control-top-button" id="fullscreen-button">全屏</button>
       </div>
     </header>
@@ -56,8 +75,8 @@
     <main class="controller-stage">
       <div class="stage-message hidden" id="stage-message">
         <span class="spinner"></span>
-        <strong>正在恢复连接</strong>
-        <small>请保持页面打开</small>
+        <strong id="stage-message-title">正在恢复连接</strong>
+        <small id="stage-message-detail">请保持页面打开</small>
       </div>
 
       <div class="phone-wrap">
@@ -111,6 +130,6 @@
   </div>
 
   <div class="toast dark" id="toast" role="status" aria-live="polite"></div>
-  <script src="/assets/controller.js?v=remote-settings-1" defer></script>
+  <script src="/assets/controller.js?v=telemetry-8" defer></script>
 </body>
 </html>

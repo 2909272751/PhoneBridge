@@ -39,7 +39,7 @@
     <main class="main-content">
       <header class="topbar">
         <div>
-          <p class="eyebrow">设备分享中心</p>
+          <p class="eyebrow">设备分享中心 <span class="top-version" id="top-version">v--</span></p>
           <h1 id="page-title">已连接设备</h1>
         </div>
         <div class="top-actions">
@@ -130,7 +130,7 @@
             <label class="switch"><input type="checkbox" checked disabled><span></span></label>
           </article>
           <article class="settings-card">
-            <div><h2>默认分享时长</h2><p>新分享默认使用30分钟，可在开始前修改。</p></div>
+            <div><h2>默认分享时长</h2><p>新分享默认不限时，可在开始前按需限制。</p></div>
             <select disabled><option>30分钟</option></select>
           </article>
           <article class="public-access-card">
@@ -178,9 +178,9 @@
         <legend>分享时长</legend>
         <div class="segment-control" id="duration-control">
           <label><input type="radio" name="duration" value="15"><span>15分钟</span></label>
-          <label><input type="radio" name="duration" value="30" checked><span>30分钟</span></label>
+          <label><input type="radio" name="duration" value="30"><span>30分钟</span></label>
           <label><input type="radio" name="duration" value="60"><span>1小时</span></label>
-          <label><input type="radio" name="duration" value="0"><span>不限时</span></label>
+          <label><input type="radio" name="duration" value="0" checked><span>不限时</span></label>
         </div>
       </fieldset>
 

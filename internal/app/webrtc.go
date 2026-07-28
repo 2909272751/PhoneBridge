@@ -28,9 +28,11 @@ type webRTCPeer struct {
 	done           chan struct{}
 	frameAcks      chan uint32
 	videoTrack     *pion.TrackLocalStaticSample
-	profileUpdates chan string
+	profileUpdates chan videoProfileUpdate
 	videoOnce      sync.Once
 	videoStop      context.CancelFunc
+	streamMu       sync.RWMutex
+	stream         *scrcpyVideoStream
 	closeOnce      sync.Once
 	statsMu        sync.RWMutex
 	stats          webRTCPeerStats
@@ -76,12 +78,23 @@ type webRTCOfferRequest struct {
 func (server *Server) handleStreamProfile(writer http.ResponseWriter, request *http.Request) {
 	var input struct {
 		Profile string `json:"profile"`
+		MaxSize int    `json:"maxSize"`
+		MaxFPS  int    `json:"maxFps"`
 	}
 	if err := decodeJSON(request, &input); err != nil {
 		writeError(writer, http.StatusBadRequest, "传输策略请求无效")
 		return
 	}
 	profile := string(normalizeVideoProfile(input.Profile))
+	custom := videoProfileSettings{}
+	if profile == string(videoProfileCustom) {
+		var err error
+		custom, err = customVideoProfileSettings(input.MaxSize, input.MaxFPS)
+		if err != nil {
+			writeError(writer, http.StatusBadRequest, "自定义分辨率或帧率无效")
+			return
+		}
+	}
 	server.mu.Lock()
 	session, ok := server.sessionByTokenLocked(request.PathValue("token"), time.Now())
 	if !ok || session.ViewerState != "connected" {
@@ -89,12 +102,14 @@ func (server *Server) handleStreamProfile(writer http.ResponseWriter, request *h
 		writeError(writer, http.StatusGone, "会话尚未连接或已经结束")
 		return
 	}
+	previousProfile, previousSize, previousFPS := session.StreamProfile, session.StreamMaxSize, session.StreamMaxFPS
 	session.StreamProfile = profile
+	session.StreamMaxSize, session.StreamMaxFPS = custom.maxSize, custom.maxFPS
 	peer := server.webrtcPeers[session.ID]
 	response := publicGuestSession(*session, true)
 	server.mu.Unlock()
-	if peer != nil {
-		peer.setVideoProfile(profile)
+	if peer != nil && (previousProfile != profile || previousSize != custom.maxSize || previousFPS != custom.maxFPS) {
+		peer.setVideoProfile(profile, custom)
 	}
 	writeJSON(writer, http.StatusOK, response)
 }
@@ -109,11 +124,28 @@ func (server *Server) handleWebRTCConfig(writer http.ResponseWriter, request *ht
 		writeError(writer, http.StatusForbidden, "请先验证访问码并加入会话")
 		return
 	}
+	transportHint := "direct"
+	if server.icePublicPort != 0 {
+		transportHint = "frp-udp"
+	}
 	writeJSON(writer, http.StatusOK, map[string]any{
 		"iceServers":     server.config.ICEServers,
-		"turnConfigured": len(server.config.ICEServers) > 0,
+		"turnConfigured": hasTURNServer(server.config.ICEServers),
 		"transport":      "webrtc-datachannel",
+		"transportHint":  transportHint,
 	})
+}
+
+func hasTURNServer(servers []ICEServerConfig) bool {
+	for _, server := range servers {
+		for _, value := range server.URLs {
+			value = strings.ToLower(strings.TrimSpace(value))
+			if strings.HasPrefix(value, "turn:") || strings.HasPrefix(value, "turns:") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (server *Server) handleWebRTCOffer(writer http.ResponseWriter, request *http.Request) {
@@ -191,7 +223,7 @@ func (server *Server) answerWebRTCOffer(ctx context.Context, sessionID string, i
 		_ = pc.Close()
 		return nil, pion.SessionDescription{}, fmt.Errorf("创建 WebRTC 视频轨道失败：%w", err)
 	}
-	peer := &webRTCPeer{server: server, sessionID: sessionID, pc: pc, done: make(chan struct{}), frameAcks: make(chan uint32, 1), profileUpdates: make(chan string, 1), videoTrack: videoTrack}
+	peer := &webRTCPeer{server: server, sessionID: sessionID, pc: pc, done: make(chan struct{}), frameAcks: make(chan uint32, 1), profileUpdates: make(chan videoProfileUpdate, 1), videoTrack: videoTrack}
 	videoSender, err := pc.AddTrack(videoTrack)
 	if err != nil {
 		peer.close()
@@ -325,6 +357,30 @@ func (peer *webRTCPeer) close() {
 	})
 }
 
+func (peer *webRTCPeer) setStream(stream *scrcpyVideoStream) {
+	peer.streamMu.Lock()
+	peer.stream = stream
+	peer.streamMu.Unlock()
+}
+
+func (peer *webRTCPeer) clearStream(stream *scrcpyVideoStream) {
+	peer.streamMu.Lock()
+	if peer.stream == stream {
+		peer.stream = nil
+	}
+	peer.streamMu.Unlock()
+}
+
+func (peer *webRTCPeer) sendNativeControl(event ControlEvent) error {
+	peer.streamMu.RLock()
+	stream := peer.stream
+	peer.streamMu.RUnlock()
+	if stream == nil {
+		return errors.New("scrcpy native control stream is not ready")
+	}
+	return stream.sendControl(event)
+}
+
 func (peer *webRTCPeer) startVideoPump() {
 	peer.videoOnce.Do(func() {
 		go func() {
@@ -332,7 +388,7 @@ func (peer *webRTCPeer) startVideoPump() {
 			parent, cancel := context.WithCancel(context.Background())
 			peer.videoStop = cancel
 			defer cancel()
-			deviceID, profile, available := peer.server.connectedDeviceID(peer.sessionID)
+			deviceID, profile, custom, available := peer.server.connectedDeviceID(peer.sessionID)
 			if !available {
 				peer.recordError(errors.New("启动视频时会话或设备已不可用"))
 				peer.setVideoState("unavailable")
@@ -341,7 +397,7 @@ func (peer *webRTCPeer) startVideoPump() {
 			for {
 				peer.setVideoState("starting-scrcpy")
 				streamContext, stopStream := context.WithCancel(parent)
-				stream, err := startScrcpyVideoStream(streamContext, peer.server.config.ADBPath, deviceID, bundledScrcpyServerPath(peer.server.scrcpy.Path), profile)
+				stream, err := startScrcpyVideoStream(streamContext, peer.server.config.ADBPath, deviceID, bundledScrcpyServerPath(peer.server.scrcpy.Path), profile, custom, peer.server.sessionAllowsControl(peer.sessionID))
 				if err != nil {
 					stopStream()
 					peer.recordError(fmt.Errorf("启动 scrcpy 视频流失败：%w", err))
@@ -349,6 +405,7 @@ func (peer *webRTCPeer) startVideoPump() {
 					peer.server.setWebRTCState(peer.sessionID, "fallback-screen")
 					return
 				}
+				peer.setStream(stream)
 				peer.setVideoState("receiving-h264")
 				writer := newLatestSampleWriter(peer.videoTrack, func() {
 					peer.statsMu.Lock()
@@ -368,18 +425,21 @@ func (peer *webRTCPeer) startVideoPump() {
 
 				select {
 				case next := <-peer.profileUpdates:
-					profile = string(normalizeVideoProfile(next))
+					profile, custom = next.profile, next.custom
 					peer.setVideoState("switching-profile")
+					peer.clearStream(stream)
 					stream.close()
 					stopStream()
 					<-forwardDone
 					writer.Close()
 					continue
 				case err = <-forwardDone:
+					peer.clearStream(stream)
 					stream.close()
 					stopStream()
 					writer.Close()
 				case <-parent.Done():
+					peer.clearStream(stream)
 					stream.close()
 					stopStream()
 					<-forwardDone
@@ -397,17 +457,23 @@ func (peer *webRTCPeer) startVideoPump() {
 	})
 }
 
-func (peer *webRTCPeer) setVideoProfile(profile string) {
+type videoProfileUpdate struct {
+	profile string
+	custom  videoProfileSettings
+}
+
+func (peer *webRTCPeer) setVideoProfile(profile string, custom videoProfileSettings) {
 	profile = string(normalizeVideoProfile(profile))
+	update := videoProfileUpdate{profile: profile, custom: custom}
 	select {
-	case peer.profileUpdates <- profile:
+	case peer.profileUpdates <- update:
 	default:
 		select {
 		case <-peer.profileUpdates:
 		default:
 		}
 		select {
-		case peer.profileUpdates <- profile:
+		case peer.profileUpdates <- update:
 		default:
 		}
 	}
@@ -428,7 +494,7 @@ func (peer *webRTCPeer) startFramePump(channel *pion.DataChannel) {
 			if channel.BufferedAmount() > 512*1024 {
 				return true
 			}
-			deviceID, _, available := peer.server.connectedDeviceID(peer.sessionID)
+			deviceID, _, _, available := peer.server.connectedDeviceID(peer.sessionID)
 			if !available {
 				return false
 			}
@@ -519,14 +585,22 @@ func sendWebRTCFrame(channel *pion.DataChannel, frameID uint32, frame []byte, mi
 	return nil
 }
 
-func (server *Server) connectedDeviceID(sessionID string) (string, string, bool) {
+func (server *Server) connectedDeviceID(sessionID string) (string, string, videoProfileSettings, bool) {
 	server.mu.RLock()
 	defer server.mu.RUnlock()
 	session := server.sessions[sessionID]
 	if session == nil || session.IsDemo || session.State == "stopped" || session.State == "expired" || session.ViewerState != "connected" {
-		return "", "", false
+		return "", "", videoProfileSettings{}, false
 	}
-	return session.DeviceID, session.StreamProfile, true
+	custom, _ := customVideoProfileSettings(session.StreamMaxSize, session.StreamMaxFPS)
+	return session.DeviceID, session.StreamProfile, custom, true
+}
+
+func (server *Server) sessionAllowsControl(sessionID string) bool {
+	server.mu.RLock()
+	defer server.mu.RUnlock()
+	session := server.sessions[sessionID]
+	return session != nil && !session.IsDemo && session.State != "stopped" && session.State != "expired" && session.ViewerState == "connected" && session.Mode == "control"
 }
 
 func (server *Server) setWebRTCState(sessionID, state string) {
@@ -558,8 +632,12 @@ func (server *Server) handlePeerControl(sessionID string, event ControlEvent) {
 		session.pointerStart = nil
 	}
 	deviceID, demo := session.DeviceID, session.IsDemo
+	peer := server.webrtcPeers[sessionID]
 	server.mu.Unlock()
 	if !demo {
+		if peer != nil && peer.sendNativeControl(event) == nil {
+			return
+		}
 		_ = server.dispatchControl(deviceID, event, start)
 	}
 }

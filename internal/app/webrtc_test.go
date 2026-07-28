@@ -13,3 +13,12 @@ func TestRewriteICECandidatePort(t *testing.T) {
 		t.Fatalf("rewritten SDP = %q, want %q", got, want)
 	}
 }
+
+func TestHasTURNServer(t *testing.T) {
+	if hasTURNServer([]ICEServerConfig{{URLs: []string{"stun:example.com:3478"}}}) {
+		t.Fatal("STUN-only configuration must not be reported as TURN")
+	}
+	if !hasTURNServer([]ICEServerConfig{{URLs: []string{"turns:example.com:5349"}}}) {
+		t.Fatal("TURN configuration was not detected")
+	}
+}

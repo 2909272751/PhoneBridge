@@ -32,9 +32,14 @@ const (
 type videoProfile string
 
 const (
-	videoProfileAuto    videoProfile = "auto"
-	videoProfileSmooth  videoProfile = "smooth"
-	videoProfileQuality videoProfile = "quality"
+	videoProfileAuto     videoProfile = "auto"
+	videoProfileSmooth   videoProfile = "smooth"
+	videoProfileLow      videoProfile = "low"
+	videoProfileStandard videoProfile = "standard"
+	videoProfileHD       videoProfile = "hd"
+	videoProfileQuality  videoProfile = "quality"
+	videoProfileUltra    videoProfile = "ultra"
+	videoProfileCustom   videoProfile = "custom"
 )
 
 type videoProfileSettings struct {
@@ -44,51 +49,106 @@ type videoProfileSettings struct {
 }
 
 func normalizeVideoProfile(value string) videoProfile {
-	if strings.EqualFold(strings.TrimSpace(value), string(videoProfileSmooth)) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case string(videoProfileSmooth):
 		return videoProfileSmooth
-	}
-	if strings.EqualFold(strings.TrimSpace(value), string(videoProfileQuality)) {
+	case string(videoProfileLow):
+		return videoProfileLow
+	case string(videoProfileStandard):
+		return videoProfileStandard
+	case string(videoProfileHD):
+		return videoProfileHD
+	case string(videoProfileQuality):
 		return videoProfileQuality
+	case string(videoProfileUltra):
+		return videoProfileUltra
+	case string(videoProfileCustom):
+		return videoProfileCustom
 	}
-	return videoProfileAuto
+	// There is no adaptive profile in v1.0.0: unsupported or missing values
+	// deliberately resolve to the fixed 720p/24fps default.
+	return videoProfileHD
 }
 
 func settingsForVideoProfile(profile videoProfile) videoProfileSettings {
+	// Auto deliberately starts at 720p rather than a conservative middle tier:
+	// WebRTC can shed stale frames, while users notice soft text immediately.
+	// The browser controller only steps down after sustained congestion.
+	if profile == videoProfileUltra {
+		return videoProfileSettings{bitrate: 4_500_000, maxSize: 1080, maxFPS: 30}
+	}
 	if profile == videoProfileQuality {
-		return videoProfileSettings{bitrate: 2_500_000, maxSize: 960, maxFPS: 24}
+		return videoProfileSettings{bitrate: 3_200_000, maxSize: 960, maxFPS: 24}
+	}
+	if profile == videoProfileHD || profile == videoProfileAuto {
+		return videoProfileSettings{bitrate: 2_100_000, maxSize: 720, maxFPS: 24}
+	}
+	if profile == videoProfileStandard {
+		return videoProfileSettings{bitrate: 1_250_000, maxSize: 540, maxFPS: 18}
+	}
+	if profile == videoProfileLow {
+		return videoProfileSettings{bitrate: 900_000, maxSize: 480, maxFPS: 15}
 	}
 	if profile == videoProfileSmooth {
-		return videoProfileSettings{bitrate: 600_000, maxSize: 360, maxFPS: 10}
+		return videoProfileSettings{bitrate: 550_000, maxSize: 360, maxFPS: 10}
 	}
-	// A public remote-control session values freshness over pixel-perfect
-	// quality. These settings leave headroom for an 88FRP/WebRTC UDP route.
-	return videoProfileSettings{bitrate: 900_000, maxSize: 540, maxFPS: 18}
+	return settingsForVideoProfile(videoProfileAuto)
+}
+
+func customVideoProfileSettings(maxSize, maxFPS int) (videoProfileSettings, error) {
+	validSizes := map[int]bool{360: true, 480: true, 540: true, 720: true, 960: true, 1080: true}
+	validFPS := map[int]bool{10: true, 15: true, 18: true, 24: true, 30: true}
+	if !validSizes[maxSize] || !validFPS[maxFPS] {
+		return videoProfileSettings{}, errors.New("custom video settings must use a supported resolution and frame rate")
+	}
+	// Scale bitrate to the selected pixel rate, then cap it to the highest
+	// built-in tier so arbitrary combinations stay safe for public sharing.
+	bitrate := int(float64(maxSize*maxSize*maxFPS) * 0.17)
+	if bitrate < 550_000 {
+		bitrate = 550_000
+	}
+	if bitrate > 4_500_000 {
+		bitrate = 4_500_000
+	}
+	return videoProfileSettings{bitrate: bitrate, maxSize: maxSize, maxFPS: maxFPS}, nil
 }
 
 // scrcpyVideoStream reads the bundled scrcpy server protocol directly. The
 // device encodes H.264 with MediaCodec; no desktop window, screenshot loop or
 // H.264 decoder is inserted on the host path.
 type scrcpyVideoStream struct {
-	adbPath  string
-	deviceID string
-	server   string
-	profile  videoProfileSettings
-	port     int
-	command  *exec.Cmd
-	output   bytes.Buffer
-	done     chan struct{}
-	waitMu   sync.RWMutex
-	waitErr  error
-	conn     net.Conn
-	cancel   context.CancelFunc
+	adbPath   string
+	deviceID  string
+	server    string
+	profile   videoProfileSettings
+	port      int
+	command   *exec.Cmd
+	output    bytes.Buffer
+	done      chan struct{}
+	waitMu    sync.RWMutex
+	waitErr   error
+	conn      net.Conn
+	control   net.Conn
+	controlMu sync.Mutex
+	sizeMu    sync.RWMutex
+	width     int
+	height    int
+	cancel    context.CancelFunc
 }
 
-func startScrcpyVideoStream(parent context.Context, adbPath, deviceID, serverPath string, requestedProfile string) (*scrcpyVideoStream, error) {
+func startScrcpyVideoStream(parent context.Context, adbPath, deviceID, serverPath string, requestedProfile string, customProfile videoProfileSettings, enableControl bool) (*scrcpyVideoStream, error) {
 	if strings.TrimSpace(serverPath) == "" {
 		return nil, errors.New("未找到内置 scrcpy 组件")
 	}
+	profileType := normalizeVideoProfile(requestedProfile)
+	profile := settingsForVideoProfile(profileType)
+	if profileType == videoProfileCustom {
+		if customProfile.maxSize == 0 || customProfile.maxFPS == 0 || customProfile.bitrate == 0 {
+			return nil, errors.New("custom video profile is incomplete")
+		}
+		profile = customProfile
+	}
 	ctx, cancel := context.WithCancel(parent)
-	profile := settingsForVideoProfile(normalizeVideoProfile(requestedProfile))
 	stream := &scrcpyVideoStream{adbPath: adbPath, deviceID: deviceID, server: serverPath, profile: profile, cancel: cancel}
 	cleanup := func(err error) (*scrcpyVideoStream, error) {
 		stream.close()
@@ -122,7 +182,7 @@ func startScrcpyVideoStream(parent context.Context, adbPath, deviceID, serverPat
 		"-s", deviceID, "shell", "CLASSPATH=" + remoteServer,
 		"app_process", "/", "com.genymobile.scrcpy.Server", scrcpyServerVersion,
 		fmt.Sprintf("scid=%08x", scid), "log_level=warn",
-		"audio=false", "control=false", "tunnel_forward=true",
+		"audio=false", fmt.Sprintf("control=%t", enableControl), "tunnel_forward=true",
 		"send_device_meta=false",
 		"video_codec=h264", fmt.Sprintf("video_bit_rate=%d", profile.bitrate),
 		fmt.Sprintf("max_size=%d", profile.maxSize), fmt.Sprintf("max_fps=%d", profile.maxFPS),
@@ -179,6 +239,16 @@ func startScrcpyVideoStream(parent context.Context, adbPath, deviceID, serverPat
 				return cleanup(fmt.Errorf("unexpected scrcpy video service readiness byte: 0x%02x", ready[0]))
 			}
 			stream.conn = connection
+			if enableControl {
+				control, controlErr := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 2*time.Second)
+				if controlErr != nil {
+					return cleanup(fmt.Errorf("connect scrcpy control socket: %w", controlErr))
+				}
+				if tcp, ok := control.(*net.TCPConn); ok {
+					_ = tcp.SetNoDelay(true)
+				}
+				stream.control = control
+			}
 			return stream, nil
 		}
 		select {
@@ -219,6 +289,12 @@ func (stream *scrcpyVideoStream) close() {
 		_ = stream.conn.Close()
 		stream.conn = nil
 	}
+	stream.controlMu.Lock()
+	if stream.control != nil {
+		_ = stream.control.Close()
+		stream.control = nil
+	}
+	stream.controlMu.Unlock()
 	if stream.port != 0 && stream.adbPath != "" && stream.deviceID != "" {
 		_ = exec.Command(stream.adbPath, "-s", stream.deviceID, "forward", "--remove", "tcp:"+strconv.Itoa(stream.port)).Run()
 		stream.port = 0
@@ -261,6 +337,7 @@ func (stream *scrcpyVideoStream) forward(track sampleWriter, onFrame func(width,
 	if width < 1 || height < 1 {
 		return fmt.Errorf("scrcpy returned invalid video dimensions: %dx%d", width, height)
 	}
+	stream.setSize(width, height)
 	if onFrame != nil {
 		onFrame(width, height)
 	}
@@ -283,6 +360,7 @@ func (stream *scrcpyVideoStream) forward(track sampleWriter, onFrame func(width,
 			if width < 1 || height < 1 {
 				return fmt.Errorf("scrcpy returned invalid resized dimensions: %dx%d", width, height)
 			}
+			stream.setSize(width, height)
 			if onFrame != nil {
 				onFrame(width, height)
 			}
@@ -320,6 +398,136 @@ func (stream *scrcpyVideoStream) forward(track sampleWriter, onFrame func(width,
 			return err
 		}
 	}
+}
+
+func (stream *scrcpyVideoStream) setSize(width, height int) {
+	stream.sizeMu.Lock()
+	stream.width, stream.height = width, height
+	stream.sizeMu.Unlock()
+}
+
+func (stream *scrcpyVideoStream) videoSize() (int, int, bool) {
+	stream.sizeMu.RLock()
+	defer stream.sizeMu.RUnlock()
+	return stream.width, stream.height, stream.width > 0 && stream.height > 0 && stream.width <= 65535 && stream.height <= 65535
+}
+
+// sendControl writes scrcpy's documented binary control protocol directly to
+// the server control socket. It avoids launching an adb process per gesture
+// and, unlike `adb shell input swipe`, preserves intermediate move events.
+func (stream *scrcpyVideoStream) sendControl(event ControlEvent) error {
+	message, err := stream.controlMessage(event)
+	if err != nil || len(message) == 0 {
+		return err
+	}
+	stream.controlMu.Lock()
+	defer stream.controlMu.Unlock()
+	if stream.control == nil {
+		return errors.New("scrcpy native control channel is unavailable")
+	}
+	_, err = stream.control.Write(message)
+	return err
+}
+
+func (stream *scrcpyVideoStream) controlMessage(event ControlEvent) ([]byte, error) {
+	const (
+		controlInjectKeycode = 0
+		controlInjectText    = 1
+		controlInjectTouch   = 2
+		controlInjectScroll  = 3
+		pointerFingerID      = ^uint64(1) // scrcpy's SC_POINTER_ID_GENERIC_FINGER
+	)
+	if event.Type == "pointer-down" || event.Type == "pointer-move" || event.Type == "pointer-up" {
+		width, height, ok := stream.videoSize()
+		if !ok {
+			return nil, errors.New("scrcpy video dimensions are not ready")
+		}
+		action := byte(0)
+		pressure := uint16(0xffff)
+		switch event.Type {
+		case "pointer-move":
+			action = 2
+		case "pointer-up":
+			action, pressure = 1, 0
+		}
+		message := make([]byte, 32)
+		message[0], message[1] = controlInjectTouch, action
+		binary.BigEndian.PutUint64(message[2:10], pointerFingerID)
+		binary.BigEndian.PutUint32(message[10:14], uint32(normalizedCoordinate(event.X, width)))
+		binary.BigEndian.PutUint32(message[14:18], uint32(normalizedCoordinate(event.Y, height)))
+		binary.BigEndian.PutUint16(message[18:20], uint16(width))
+		binary.BigEndian.PutUint16(message[20:22], uint16(height))
+		binary.BigEndian.PutUint16(message[22:24], pressure)
+		return message, nil
+	}
+	if event.Type == "scroll" {
+		width, height, ok := stream.videoSize()
+		if !ok {
+			return nil, errors.New("scrcpy video dimensions are not ready")
+		}
+		message := make([]byte, 21)
+		message[0] = controlInjectScroll
+		binary.BigEndian.PutUint32(message[1:5], uint32(width/2))
+		binary.BigEndian.PutUint32(message[5:9], uint32(height/2))
+		binary.BigEndian.PutUint16(message[9:11], uint16(width))
+		binary.BigEndian.PutUint16(message[11:13], uint16(height))
+		binary.BigEndian.PutUint16(message[13:15], uint16(signedScroll(event.X)))
+		binary.BigEndian.PutUint16(message[15:17], uint16(signedScroll(event.Y)))
+		return message, nil
+	}
+	if event.Type == "system" || event.Type == "key" {
+		if event.Type == "key" && len([]rune(event.Key)) == 1 {
+			text := []byte(event.Key)
+			if len(text) > 300 {
+				return nil, errors.New("text input is too long")
+			}
+			message := make([]byte, 5+len(text))
+			message[0] = controlInjectText
+			binary.BigEndian.PutUint32(message[1:5], uint32(len(text)))
+			copy(message[5:], text)
+			return message, nil
+		}
+		keycode, ok := nativeKeycode(event)
+		if !ok {
+			return nil, nil
+		}
+		// Android key input is a down/up pair. Sending both in one socket write
+		// preserves order without a second WebRTC/ADB round trip.
+		message := make([]byte, 28)
+		for index, action := range []byte{0, 1} {
+			offset := index * 14
+			message[offset] = controlInjectKeycode
+			message[offset+1] = action
+			binary.BigEndian.PutUint32(message[offset+2:offset+6], keycode)
+		}
+		return message, nil
+	}
+	return nil, nil
+}
+
+func normalizedCoordinate(value float64, extent int) int {
+	if value < 0 {
+		value = 0
+	} else if value > 1 {
+		value = 1
+	}
+	return int(value * float64(extent-1))
+}
+
+func signedScroll(value float64) int16 {
+	if value > 0 {
+		return 32767
+	}
+	if value < 0 {
+		return -32768
+	}
+	return 0
+}
+
+func nativeKeycode(event ControlEvent) (uint32, bool) {
+	keys := map[string]uint32{"power": 26, "volume-up": 24, "volume-down": 25, "back": 4, "home": 3, "recents": 187, "Enter": 66, "Backspace": 67, "Escape": 4}
+	key, ok := keys[event.Key]
+	return key, ok
 }
 
 type sampleWriter interface {

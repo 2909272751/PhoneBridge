@@ -12,10 +12,15 @@ let webRTCFrame = null;
 let currentFrameURL = null;
 let fallbackPauseTimer = null;
 let fallbackRetryTimer = null;
-let autoProfileTimer = null;
-let autoAppliedProfile = "auto";
-let autoGoodSamples = 0;
-let autoLastInbound = null;
+let selectedProfile = "hd";
+let transportHint = "direct";
+let transportMonitorTimer = null;
+let transportLastBytes = null;
+let transportLastAt = null;
+let pendingPointerMove = null;
+let pointerMoveTimer = null;
+let profileSwitchTimer = null;
+let profileSwitching = false;
 
 async function api(url, options = {}) {
   const response = await fetch(url, {
@@ -76,6 +81,13 @@ async function joinSession(event) {
 }
 
 function showController() {
+  selectedProfile = session.streamProfile && session.streamProfile !== "auto" ? session.streamProfile : "hd";
+  if ([...$("#stream-profile").options].some((option) => option.value === selectedProfile)) {
+    $("#stream-profile").value = selectedProfile;
+  } else {
+    selectedProfile = "hd";
+    $("#stream-profile").value = "hd";
+  }
   $("#join-page").classList.add("hidden");
   $("#controller-shell").classList.remove("hidden");
   $("#controller-device-name").textContent = session.deviceName;
@@ -153,17 +165,46 @@ function setupPhoneInput() {
   };
   screen.addEventListener("pointerdown", (event) => {
     pointerDown = true;
+	  pendingPointerMove = null;
     screen.setPointerCapture(event.pointerId);
     sendControl("pointer-down", normalizedPoint(event));
   });
   screen.addEventListener("pointermove", (event) => {
-    if (pointerDown) sendControl("pointer-move", normalizedPoint(event));
+    if (!pointerDown) return;
+    event.preventDefault();
+    // scrcpy's native control channel consumes real move events. Coalesce them
+    // to 30fps so a lossy ordered data channel cannot build a stale backlog.
+    pendingPointerMove = normalizedPoint(event);
+    if (!pointerMoveTimer) {
+      pointerMoveTimer = setTimeout(() => {
+        pointerMoveTimer = null;
+        if (pointerDown && pendingPointerMove) {
+          sendControl("pointer-move", pendingPointerMove);
+          pendingPointerMove = null;
+        }
+      }, 33);
+    }
   });
   screen.addEventListener("pointerup", (event) => {
+    if (pointerMoveTimer) {
+      clearTimeout(pointerMoveTimer);
+      pointerMoveTimer = null;
+    }
+    if (pendingPointerMove) {
+      sendControl("pointer-move", pendingPointerMove);
+      pendingPointerMove = null;
+    }
     pointerDown = false;
     sendControl("pointer-up", normalizedPoint(event));
   });
-  screen.addEventListener("pointercancel", () => { pointerDown = false; });
+  screen.addEventListener("pointercancel", (event) => {
+    if (!pointerDown) return;
+    if (pointerMoveTimer) clearTimeout(pointerMoveTimer);
+    pointerMoveTimer = null;
+    pendingPointerMove = null;
+    pointerDown = false;
+    sendControl("pointer-up", normalizedPoint(event));
+  });
   screen.addEventListener("wheel", (event) => {
     event.preventDefault();
     sendControl("scroll", { x: Math.sign(event.deltaX), y: Math.sign(event.deltaY) });
@@ -195,55 +236,135 @@ function setupButtons() {
   });
 }
 
-async function applyStreamProfile(profile, automatic = false) {
+function profileLabel(profile, custom = null) {
+  if (profile === "custom" && custom) return `${custom.maxSize}p / ${custom.maxFps}fps`;
+  return ({ smooth: "360p / 10fps", low: "480p / 15fps", standard: "540p / 18fps", hd: "720p / 24fps", quality: "960p / 24fps", ultra: "1080p / 30fps", auto: "自动（720p 基线）" })[profile] || "视频设置";
+}
+
+function setStageMessage(title, detail, switching = false) {
+  $("#stage-message-title").textContent = title;
+  $("#stage-message-detail").textContent = detail;
+  $("#stage-message").classList.toggle("profile-switching", switching);
+  $("#stage-message").classList.remove("hidden");
+}
+
+function beginProfileSwitch(profile, automatic, custom) {
+  profileSwitching = true;
+  clearTimeout(profileSwitchTimer);
+  const label = profileLabel(profile, custom);
+  setStageMessage(automatic ? `正在自动调整至 ${label}` : `正在切换至 ${label}`, automatic ? "网络状态变化，正在平滑调整，约需 2–5 秒" : "正在重启手机视频编码器，控制连接会保持", true);
+  $("#stream-profile").disabled = true;
+  $("#apply-custom-profile").disabled = true;
+  profileSwitchTimer = setTimeout(() => finishProfileSwitch(false), 8000);
+}
+
+function finishProfileSwitch(videoReady = true) {
+  if (!profileSwitching) return;
+  profileSwitching = false;
+  clearTimeout(profileSwitchTimer);
+  profileSwitchTimer = null;
+  $("#stream-profile").disabled = false;
+  $("#apply-custom-profile").disabled = false;
+  $("#stage-message").classList.add("hidden");
+  $("#stage-message").classList.remove("profile-switching");
+  if (!videoReady) showToast("画质切换仍在恢复中，可稍候或重新选择档位", true);
+}
+
+async function applyStreamProfile(profile, automatic = true, custom = null) {
   if (!joined || session.isDemo) return;
   const selector = $("#stream-profile");
+  beginProfileSwitch(profile, false, custom);
   try {
     await api(`/api/public/sessions/${encodeURIComponent(token)}/stream-profile`, {
       method: "POST",
-      body: JSON.stringify({ profile }),
+      body: JSON.stringify({ profile, ...(custom || {}) }),
     });
     if (!automatic) showToast(profile === "smooth" ? "已切换至流畅优先" : profile === "quality" ? "已切换至画质优先" : "已启用自动调节");
-    autoAppliedProfile = profile;
+    selectedProfile = profile;
+    showToast(`已切换至 ${profileLabel(profile, custom)}`);
+    tuneReceiverBuffer(profile);
   } catch (error) {
+    finishProfileSwitch(false);
     if (!automatic) showToast(error.message, true);
-    selector.value = "auto";
+    selector.value = selectedProfile;
   }
 }
 
-function startAutoProfile() {
-  clearInterval(autoProfileTimer);
-  autoProfileTimer = setInterval(async () => {
-    if (!joined || $("#stream-profile").value !== "auto" || !peerConnection) return;
+function updateTransportIndicator(reports, pair, rtt) {
+  if (!pair) return;
+  const local = pair.localCandidateId ? reports.get(pair.localCandidateId) : null;
+  const remote = pair.remoteCandidateId ? reports.get(pair.remoteCandidateId) : null;
+  const usesTURN = local?.candidateType === "relay" || remote?.candidateType === "relay";
+  let path = "WebRTC 直连";
+  if (usesTURN) path = "TURN 中继";
+  else if (transportHint === "frp-udp") path = "FRP UDP";
+  else if (local?.candidateType === "host" && remote?.candidateType === "host") path = "局域网直连";
+  const delay = rtt > 0 ? ` · ${Math.round(rtt * 1000)}ms` : "";
+  $("#latency-chip").textContent = path + delay;
+}
+
+function renderTransferSpeed(reports) {
+  let inbound = null;
+  reports.forEach((report) => {
+    if (report.type === "inbound-rtp" && report.kind === "video") inbound = report;
+  });
+  if (!inbound || inbound.bytesReceived == null) return;
+  const now = performance.now();
+  const bytes = Number(inbound.bytesReceived);
+  let bitsPerSecond = 0;
+  if (transportLastBytes != null && transportLastAt != null && now > transportLastAt) {
+    bitsPerSecond = Math.max(0, (bytes - transportLastBytes) * 8000 / (now - transportLastAt));
+  }
+  transportLastBytes = bytes;
+  transportLastAt = now;
+  const label = bitsPerSecond >= 1_000_000
+    ? `${(bitsPerSecond / 1_000_000).toFixed(1)} Mbps`
+    : `${Math.round(bitsPerSecond / 1000)} Kbps`;
+  $("#mobile-transport").textContent = `传输 ${label}`;
+  const chip = $("#latency-chip");
+  chip.dataset.speed = label;
+  if (!chip.textContent.includes(label)) chip.textContent = `${chip.textContent.replace(/ · [\d.]+ (?:M|K)bps$/, "")} · ${label}`;
+}
+
+function startTransportMonitor() {
+  clearInterval(transportMonitorTimer);
+  transportLastBytes = null;
+  transportLastAt = null;
+  transportMonitorTimer = setInterval(async () => {
+    if (!joined || !peerConnection) return;
     const reports = await peerConnection.getStats().catch(() => null);
     if (!reports) return;
-    let rtt = 0;
-    let inbound = null;
+    let pair = null;
     reports.forEach((report) => {
-      if (report.type === "candidate-pair" && (report.nominated || report.state === "succeeded") && report.currentRoundTripTime != null) rtt = Math.max(rtt, report.currentRoundTripTime);
-      if (report.type === "inbound-rtp" && report.kind === "video") inbound = report;
+      if (report.type === "candidate-pair" && report.state === "succeeded" && (report.nominated || !pair)) pair = report;
     });
-    if (!inbound) return;
-    let lossRate = 0;
-    if (autoLastInbound) {
-      const received = Math.max(0, inbound.packetsReceived - autoLastInbound.received);
-      const lost = Math.max(0, inbound.packetsLost - autoLastInbound.lost);
-      lossRate = lost / Math.max(1, received + lost);
+    updateTransportIndicator(reports, pair, pair?.currentRoundTripTime || 0);
+    renderTransferSpeed(reports);
+  }, 1000);
+}
+
+function stopTransportMonitor() {
+  clearInterval(transportMonitorTimer);
+  transportMonitorTimer = null;
+  transportLastBytes = null;
+  transportLastAt = null;
+  $("#mobile-transport").textContent = "传输 --";
+}
+
+function tuneReceiverBuffer(profile) {
+  if (!peerConnection) return;
+  const targetMilliseconds = profile === "smooth" ? 100 : profile === "low" ? 85 : profile === "standard" ? 70 : profile === "hd" ? 60 : profile === "quality" ? 50 : 45;
+  peerConnection.getReceivers().forEach((receiver) => {
+    try {
+      if ("jitterBufferTarget" in receiver) {
+        receiver.jitterBufferTarget = targetMilliseconds;
+      } else if ("playoutDelayHint" in receiver) {
+        receiver.playoutDelayHint = targetMilliseconds / 1000;
+      }
+    } catch {
+      // Browsers clamp unsupported targets; WebRTC's default remains safe.
     }
-    autoLastInbound = { received: inbound.packetsReceived || 0, lost: inbound.packetsLost || 0 };
-    let target = autoAppliedProfile;
-    if (rtt > 0.25 || lossRate > 0.02) {
-      autoGoodSamples = 0;
-      target = "smooth";
-    } else if (rtt > 0 && rtt < 0.12 && lossRate < 0.003) {
-      autoGoodSamples += 1;
-      if (autoGoodSamples >= 3) target = "quality";
-    } else {
-      autoGoodSamples = 0;
-      target = "auto";
-    }
-    if (target !== autoAppliedProfile) await applyStreamProfile(target, true);
-  }, 3000);
+  });
 }
 
 function animateDemoControl(type, detail) {
@@ -282,11 +403,19 @@ function updateCountdown() {
 }
 
 function showReconnect() {
+  profileSwitching = false;
+  clearTimeout(profileSwitchTimer);
+  $("#stream-profile").disabled = false;
+  $("#apply-custom-profile").disabled = false;
+  $("#stage-message").classList.remove("profile-switching");
+  $("#stage-message-title").textContent = "正在恢复连接";
+  $("#stage-message-detail").textContent = "请保持页面打开";
   $("#stage-message").classList.remove("hidden");
   $("#connection-chip").innerHTML = "<i class=\"warning\"></i>正在重连";
 }
 
 function hideReconnect() {
+  if (profileSwitching) return;
   $("#stage-message").classList.add("hidden");
   if (session?.isDemo) $("#connection-chip").innerHTML = "<i></i>演示连接";
 }
@@ -337,6 +466,7 @@ function prioritizeNativeVideo() {
 async function startWebRTC() {
   try {
     const config = await api(`/api/public/sessions/${encodeURIComponent(token)}/webrtc/config`);
+    transportHint = config.transportHint || "direct";
     peerConnection?.close();
     peerConnection = new RTCPeerConnection({ iceServers: config.iceServers || [] });
     peerConnection.addTransceiver("video", { direction: "recvonly" });
@@ -344,17 +474,19 @@ async function startWebRTC() {
     dataChannel.binaryType = "arraybuffer";
     dataChannel.onopen = () => {
       $("#connection-chip").innerHTML = "<i></i>WebRTC 已连接";
-      $("#latency-chip").textContent = config.turnConfigured ? "WebRTC / TURN" : "FRP UDP 通道";
+      $("#latency-chip").textContent = transportHint === "frp-udp" ? "FRP UDP 探测中" : "WebRTC 探测中";
       prioritizeNativeVideo();
-      startAutoProfile();
+      startTransportMonitor();
     };
     dataChannel.onclose = () => {
       dataChannel = null;
+      stopTransportMonitor();
       if (joined) startFallbackFrames();
     };
     dataChannel.onmessage = receiveWebRTCMessage;
     peerConnection.ontrack = (event) => {
       if (event.track.kind !== "video") return;
+      tuneReceiverBuffer(selectedProfile);
       const video = $("#device-video");
       video.srcObject = event.streams[0] || new MediaStream([event.track]);
       // Receiving a track is not the same as decoding a frame. Keep the
@@ -367,6 +499,7 @@ async function startWebRTC() {
         $("#fallback-frame").classList.remove("visible");
         $("#video-placeholder").classList.add("hidden");
         stopFallbackFrames();
+        finishProfileSwitch(true);
       };
       video.onloadeddata = showDecodedVideo;
       video.onplaying = showDecodedVideo;
@@ -451,6 +584,7 @@ function receiveWebRTCFrameChunk(data) {
     currentFrameURL = nextURL;
     $("#video-placeholder").classList.add("hidden");
     stopFallbackFrames();
+	finishProfileSwitch(true);
 	$("#phone-screen").dataset.webrtcFrame = `shown:${completedFrameID}`;
 	try {
 	  dataChannel?.send(JSON.stringify({ kind: "frame-ack", id: completedFrameID }));
@@ -471,7 +605,7 @@ function endSession(message) {
   clearInterval(pollTimer);
   clearTimeout(fallbackPauseTimer);
   clearTimeout(fallbackRetryTimer);
-  clearInterval(autoProfileTimer);
+  stopTransportMonitor();
   stopFallbackFrames();
   peerConnection?.close();
   peerConnection = null;
@@ -516,9 +650,18 @@ document.addEventListener("DOMContentLoaded", () => {
     event.target.value = digits.length > 3 ? `${digits.slice(0, 3)} ${digits.slice(3)}` : digits;
   });
   $("#stream-profile").addEventListener("change", (event) => {
-    autoGoodSamples = 0;
-    autoLastInbound = null;
+    if (event.target.value === "custom") {
+      $("#custom-profile").classList.remove("hidden");
+      return;
+    }
+    $("#custom-profile").classList.add("hidden");
     applyStreamProfile(event.target.value);
+  });
+  $("#apply-custom-profile").addEventListener("click", () => {
+    const maxSize = Number($("#custom-size").value);
+    const maxFps = Number($("#custom-fps").value);
+    applyStreamProfile("custom", true, { maxSize, maxFps });
+    $("#custom-profile").classList.add("hidden");
   });
   setupPhoneInput();
   setupButtons();

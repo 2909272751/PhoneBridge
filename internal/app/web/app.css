@@ -60,6 +60,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .topbar { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 28px; }
 .eyebrow { margin: 0 0 5px; color: var(--blue); font-size: 11px; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
 .topbar h1 { margin: 0; font-size: 28px; letter-spacing: -.8px; }
+.top-version { display: inline-block; margin-left: 6px; padding: 2px 6px; border-radius: 99px; background: #e7efff; color: #2f6ded; font: 700 9px/1 "Cascadia Mono", monospace; vertical-align: 1px; }
 .top-actions { display: flex; align-items: center; gap: 10px; }
 .cloud-pill { display: flex; align-items: center; gap: 9px; padding: 9px 13px; border: 1px solid var(--line); border-radius: 99px; background: rgba(255,255,255,.8); font-size: 12px; font-weight: 650; color: #505b70; }
 .icon-button { width: 38px; height: 38px; border: 1px solid var(--line); border-radius: 11px; background: #fff; color: #4d5970; font-size: 20px; }
@@ -240,6 +241,8 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .controller-topbar { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 18px; padding: 0 18px; border-bottom: 1px solid rgba(255,255,255,.07); background: #0c111c; }
 .controller-brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .controller-brand strong { font-size: 14px; }
+.web-version { margin-left: 5px; color: #7082a1; font: 600 9px/1 "Cascadia Mono", monospace; vertical-align: middle; }
+.mobile-transport { display: none; }
 .controller-brand span { overflow: hidden; padding-left: 12px; border-left: 1px solid #303849; color: #8d99ad; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .connection-chips { display: flex; align-items: center; gap: 8px; }
 .connection-chip, .latency-chip { display: inline-flex; align-items: center; gap: 7px; padding: 7px 10px; border: 1px solid #283146; border-radius: 99px; background: #121a29; color: #aeb9cb; font-size: 10px; }
@@ -248,8 +251,12 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .controller-actions { display: flex; justify-content: flex-end; align-items: center; gap: 11px; }
 .controller-countdown { color: #aeb9cb; font: 700 11px/1 "Cascadia Mono",monospace; }
 .control-top-button { padding: 7px 11px; border: 1px solid #2d374b; border-radius: 8px; background: #151d2b; color: #c1cad9; font-size: 10px; }
-.stream-profile { height: 30px; min-width: 142px; max-width: 160px; padding: 0 7px; border: 1px solid #2d374b; border-radius: 8px; outline: none; background: #151d2b; color: #c1cad9; font-size: 10px; }
+.stream-profile { height: 30px; min-width: 176px; max-width: 196px; padding: 0 7px; border: 1px solid #2d374b; border-radius: 8px; outline: none; background: #151d2b; color: #c1cad9; font-size: 10px; }
 .stream-profile:focus { border-color: #5b88f4; box-shadow: 0 0 0 3px rgba(75,121,231,.16); }
+.custom-profile { position: fixed; z-index: 40; top: 64px; right: 18px; display: grid; grid-template-columns: 1fr 1fr auto; align-items: end; gap: 8px; padding: 10px; border: 1px solid #344261; border-radius: 11px; background: #121b2c; box-shadow: 0 14px 38px rgba(0,0,0,.38); color: #adbad0; font-size: 10px; }
+.custom-profile label { display: grid; gap: 4px; }
+.custom-profile select, .custom-profile button { height: 29px; border: 1px solid #3b4b67; border-radius: 6px; background: #0d1524; color: #e4ecfb; font-size: 11px; }
+.custom-profile button { padding: 0 10px; border-color: #4a7df0; background: #2d63db; color: #fff; font-weight: 700; cursor: pointer; }
 .controller-stage { position: relative; min-height: 0; display: grid; place-items: center; padding: 18px; overflow: hidden; background: radial-gradient(circle at center,#18243b 0,#080c13 58%); }
 .phone-wrap { position: relative; display: flex; align-items: center; gap: 18px; height: 100%; max-height: calc(100vh - 170px); }
 .phone-hardware { position: relative; height: 100%; aspect-ratio: 9/19.5; max-width: calc(100vw - 130px); padding: 9px; border: 2px solid #3b4351; border-radius: 30px; background: #05070a; box-shadow: 0 28px 70px rgba(0,0,0,.55), inset 0 0 0 2px #10151e; }
@@ -292,6 +299,10 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .stage-message { position: absolute; z-index: 20; inset: 0; display: grid; place-content: center; justify-items: center; gap: 8px; background: rgba(5,8,14,.78); backdrop-filter: blur(6px); }
 .stage-message strong { font-size: 14px; }
 .stage-message small { color: #8c98ac; font-size: 10px; }
+.stage-message.profile-switching { inset: auto 16px 16px auto; min-width: 210px; padding: 10px 13px; place-content: initial; justify-items: start; border: 1px solid rgba(99,145,248,.45); border-radius: 11px; background: rgba(13,23,41,.92); box-shadow: 0 12px 30px rgba(0,0,0,.35); backdrop-filter: blur(12px); pointer-events: none; }
+.stage-message.profile-switching strong { color: #e3ebff; font-size: 11px; }
+.stage-message.profile-switching small { color: #9eb1d6; font-size: 9px; }
+.stage-message.profile-switching .spinner { width: 17px; height: 17px; grid-row: span 2; align-self: center; }
 .spinner { width: 25px; height: 25px; border: 2px solid #394359; border-top-color: #6693fc; border-radius: 50%; animation: spin .8s linear infinite; }
 .controller-footer { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; padding: 0 18px; border-top: 1px solid rgba(255,255,255,.07); background: #0c111c; }
 .nav-controls { grid-column: 2; display: flex; gap: 15px; }
@@ -345,20 +356,42 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .segment-control { grid-template-columns: repeat(2,1fr); }
   .choice-cards { grid-template-columns: 1fr; }
   .share-dialog form { padding: 21px; }
-  .controller-topbar { grid-template-columns: 1fr auto; }
+  .controller-body { min-height: 100vh; min-height: 100dvh; overflow-x: hidden; overflow-y: auto; }
+  .controller-shell { height: 100vh; height: 100dvh; min-height: 0; grid-template-rows: auto minmax(0,1fr) auto; }
+  .controller-topbar { position: sticky; z-index: 25; top: 0; min-height: 50px; grid-template-columns: 1fr auto; }
   .connection-chips { display: none; }
   .controller-countdown, #fullscreen-button { display: none; }
   .controller-actions { gap: 0; }
-  .stream-profile { display: block; min-width: 142px; max-width: 142px; height: 34px; font-size: 11px; border-color: #416fdb; background: #16213a; color: #e2ebff; }
+  .stream-profile { display: block; min-width: 176px; max-width: 176px; height: 34px; font-size: 11px; border-color: #416fdb; background: #16213a; color: #e2ebff; }
+  .custom-profile { top: auto; right: 0; bottom: 0; left: 0; grid-template-columns: 1fr 1fr; max-width: none; padding: 18px; border-radius: 18px 18px 0 0; }
+  .custom-profile button { grid-column: 1 / -1; height: 42px; font-size: 13px; }
+  .stage-message.profile-switching { inset: auto 8px 9px 8px; min-width: 0; grid-template-columns: auto 1fr; }
   .controller-brand span { display: none; }
-  .controller-stage { padding: 10px 7px; }
-  .phone-wrap { max-height: calc(100vh - 150px); gap: 6px; }
-  .phone-hardware { max-width: calc(100vw - 56px); padding: 6px; border-radius: 24px; }
+  .mobile-transport { display: block; margin-top: 3px; color: #87a9e8; font: 600 9px/1 "Cascadia Mono", monospace; }
+  /* The stage, rather than the document, owns vertical scrolling. This keeps
+     the header/footer reachable on short phones without stealing swipes from
+     the remote phone screen itself. */
+  .controller-stage { align-items: start; padding: 10px 7px 16px; overflow-x: hidden; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior-y: contain; touch-action: pan-y; }
+  .phone-wrap { width: 100%; height: auto; min-height: calc(100dvh - 128px); max-height: none; align-items: flex-start; justify-content: center; gap: 6px; padding-bottom: 8px; }
+  .phone-hardware { width: auto; height: min(calc(100dvh - 142px), 720px); min-height: 360px; max-width: calc(100vw - 56px); padding: 6px; border-radius: 24px; }
   .phone-screen { border-radius: 17px; }
   .system-buttons { gap: 5px; }
   .system-buttons button { width: 31px; height: 31px; font-size: 13px; }
-  .controller-shell { grid-template-rows: 50px minmax(0,1fr) 64px; }
-  .controller-footer { grid-template-columns: 1fr; padding: 0 4px; }
+  .controller-footer { position: sticky; z-index: 25; bottom: 0; grid-template-columns: 1fr; padding: 0 4px; }
   .controller-footer p { display: none; }
   .nav-controls { grid-column: 1; justify-self: center; }
+}
+
+@media (max-width: 380px) and (orientation: portrait) {
+  .phone-hardware { height: min(calc(100dvh - 134px), 610px); min-height: 330px; }
+  .system-buttons button { width: 28px; height: 28px; }
+}
+
+@media (max-height: 520px) and (orientation: landscape) {
+  .controller-topbar { min-height: 44px; }
+  .controller-footer { min-height: 50px; }
+  .phone-wrap { min-height: calc(100dvh - 94px); }
+  .phone-hardware { height: min(calc(100dvh - 108px), 440px); min-height: 250px; }
+  .system-buttons { gap: 3px; }
+  .system-buttons button { width: 27px; height: 27px; }
 }

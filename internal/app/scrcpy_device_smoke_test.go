@@ -12,12 +12,33 @@ import (
 
 func TestVideoProfileSettings(t *testing.T) {
 	smooth := settingsForVideoProfile(normalizeVideoProfile("smooth"))
+	low := settingsForVideoProfile(normalizeVideoProfile("low"))
+	standard := settingsForVideoProfile(normalizeVideoProfile("standard"))
+	hd := settingsForVideoProfile(normalizeVideoProfile("hd"))
 	quality := settingsForVideoProfile(normalizeVideoProfile("quality"))
-	if smooth.maxSize >= quality.maxSize || smooth.maxFPS >= quality.maxFPS || smooth.bitrate >= quality.bitrate {
-		t.Fatalf("smooth profile must be lighter than quality: smooth=%+v quality=%+v", smooth, quality)
+	ultra := settingsForVideoProfile(normalizeVideoProfile("ultra"))
+	profiles := []videoProfileSettings{smooth, low, standard, hd, quality, ultra}
+	for index := 1; index < len(profiles); index++ {
+		if profiles[index-1].maxSize >= profiles[index].maxSize || profiles[index-1].maxFPS > profiles[index].maxFPS || profiles[index-1].bitrate >= profiles[index].bitrate {
+			t.Fatalf("profiles must increase by tier: previous=%+v current=%+v", profiles[index-1], profiles[index])
+		}
 	}
-	if got := normalizeVideoProfile("unknown"); got != videoProfileAuto {
-		t.Fatalf("unknown profile = %q, want auto", got)
+	auto := settingsForVideoProfile(normalizeVideoProfile("auto"))
+	if auto != hd {
+		t.Fatalf("auto baseline = %+v, want hd %+v", auto, hd)
+	}
+	if got := normalizeVideoProfile("unknown"); got != videoProfileHD {
+		t.Fatalf("unknown profile = %q, want hd", got)
+	}
+	custom, err := customVideoProfileSettings(960, 15)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if custom.maxSize != 960 || custom.maxFPS != 15 || custom.bitrate < 550_000 || custom.bitrate > 4_500_000 {
+		t.Fatalf("unexpected custom profile: %+v", custom)
+	}
+	if _, err := customVideoProfileSettings(640, 60); err == nil {
+		t.Fatal("unsupported custom video combination was accepted")
 	}
 }
 
@@ -42,7 +63,7 @@ func TestScrcpyDeviceSmoke(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	stream, err := startScrcpyVideoStream(ctx, bundledADBPath(scrcpy.Path), deviceID, bundledScrcpyServerPath(scrcpy.Path), string(videoProfileSmooth))
+	stream, err := startScrcpyVideoStream(ctx, bundledADBPath(scrcpy.Path), deviceID, bundledScrcpyServerPath(scrcpy.Path), string(videoProfileSmooth), videoProfileSettings{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}

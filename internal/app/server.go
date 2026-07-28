@@ -25,7 +25,7 @@ import (
 //go:embed web/*
 var embeddedWeb embed.FS
 
-const version = "0.1.0-dev"
+const version = "1.0.0"
 
 type Config struct {
 	ListenAddress string
@@ -58,6 +58,8 @@ type Server struct {
 	webRTCAPI     *pion.API
 	iceConn       *net.UDPConn
 	icePublicPort int
+	controlMu     sync.Mutex
+	controllers   map[string]*adbControlShell
 }
 
 func New(config Config, logger *log.Logger) *Server {
@@ -81,11 +83,13 @@ func New(config Config, logger *log.Logger) *Server {
 		sessions:     make(map[string]*Session),
 		sessionToken: make(map[string]string),
 		webrtcPeers:  make(map[string]*webRTCPeer),
+		controllers:  make(map[string]*adbControlShell),
 		publicAccess: NewPublicAccessManager(config.SettingsPath, config.PublicBaseURL, listenPort(config.ListenAddress), logger),
 	}
 }
 
 func (server *Server) Run() error {
+	defer server.closeControlShells()
 	server.refreshDevices(context.Background())
 	runtimeContext, cancelRuntime := context.WithCancel(context.Background())
 	defer cancelRuntime()
@@ -307,7 +311,14 @@ func (server *Server) handleCreateSession(writer http.ResponseWriter, request *h
 	if server.activeID != "" {
 		active := server.sessions[server.activeID]
 		if active != nil && active.State != "stopped" && active.State != "expired" {
-			writeError(writer, http.StatusConflict, "已有分享正在进行，请先停止当前分享")
+			if active.DeviceID == input.DeviceID {
+				// PhoneBridge is intentionally a single-phone, single-controller
+				// tool. Returning the existing link keeps it stable when the owner
+				// reopens the share dialog instead of creating dead, competing URLs.
+				writeJSON(writer, http.StatusOK, publicOwnerSession(*active))
+				return
+			}
+			writeError(writer, http.StatusConflict, "已有其他手机分享正在进行，请先停止当前分享")
 			return
 		}
 	}
@@ -414,8 +425,11 @@ func (server *Server) handleJoinSession(writer http.ResponseWriter, request *htt
 		writeError(writer, http.StatusUnauthorized, "访问码不正确")
 		return
 	}
+	// A browser refresh, mobile background resume, or switching networks must
+	// not consume the single-controller slot forever. The latest holder of the
+	// secret link replaces the old WebRTC peer when it sends a new offer.
 	if session.ViewerState == "connected" {
-		writeError(writer, http.StatusConflict, "当前设备已经有控制者")
+		writeJSON(writer, http.StatusOK, publicGuestSession(*session, true))
 		return
 	}
 	session.ViewerState = "connected"
@@ -469,8 +483,13 @@ func (server *Server) handleControlEvent(writer http.ResponseWriter, request *ht
 		session.pointerStart = nil
 	}
 	deviceID, demo := session.DeviceID, session.IsDemo
+	peer := server.webrtcPeers[session.ID]
 	server.mu.Unlock()
 	if !demo {
+		if peer != nil && peer.sendNativeControl(event) == nil {
+			writeJSON(writer, http.StatusAccepted, map[string]any{"accepted": true, "demo": false})
+			return
+		}
 		if err := server.dispatchControl(deviceID, event, start); err != nil {
 			writeError(writer, http.StatusBadGateway, err.Error())
 			return

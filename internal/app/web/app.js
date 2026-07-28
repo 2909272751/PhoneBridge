@@ -47,6 +47,7 @@ async function refreshDevices() {
 
 function renderStatus(status) {
   $("#version-label").textContent = `版本 ${status.version}`;
+  $("#top-version").textContent = `v${status.version}`;
   $("#agent-label").textContent = "后台服务运行中";
   $("#agent-dot").classList.remove("danger");
   const publicReady = status.publicAccess?.state === "manual-ready" || status.publicAccess?.state === "frp-ready";
@@ -251,7 +252,7 @@ async function createShare(event) {
       deviceId: state.selectedDevice.id,
       durationMinutes: Number(document.querySelector('input[name="duration"]:checked').value),
       mode: document.querySelector('input[name="mode"]:checked').value,
-      streamProfile: "auto",
+      streamProfile: "hd",
       requireCode: $("#require-code").checked,
       allowClipboard: $("#allow-clipboard").checked,
       allowAudio: $("#allow-audio").checked,

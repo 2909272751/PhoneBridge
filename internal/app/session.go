@@ -20,6 +20,8 @@ type Session struct {
 	AllowClipboard bool       `json:"allowClipboard"`
 	AllowAudio     bool       `json:"allowAudio"`
 	StreamProfile  string     `json:"streamProfile"`
+	StreamMaxSize  int        `json:"streamMaxSize,omitempty"`
+	StreamMaxFPS   int        `json:"streamMaxFps,omitempty"`
 	IsDemo         bool       `json:"isDemo"`
 	ViewerState    string     `json:"viewerState"`
 	ConnectionMode string     `json:"connectionMode"`
@@ -44,6 +46,8 @@ type CreateSessionRequest struct {
 	AllowClipboard bool   `json:"allowClipboard"`
 	AllowAudio     bool   `json:"allowAudio"`
 	StreamProfile  string `json:"streamProfile"`
+	StreamMaxSize  int    `json:"streamMaxSize,omitempty"`
+	StreamMaxFPS   int    `json:"streamMaxFps,omitempty"`
 }
 
 func newSession(request CreateSessionRequest, device Device, baseURL string, now time.Time) (Session, error) {
@@ -67,6 +71,13 @@ func newSession(request CreateSessionRequest, device Device, baseURL string, now
 		mode = "control"
 	}
 	profile := normalizeVideoProfile(request.StreamProfile)
+	custom := videoProfileSettings{}
+	if profile == videoProfileCustom {
+		custom, err = customVideoProfileSettings(request.StreamMaxSize, request.StreamMaxFPS)
+		if err != nil {
+			return Session{}, err
+		}
+	}
 
 	var expiresAt *time.Time
 	if request.DurationMinute > 0 {
@@ -85,6 +96,8 @@ func newSession(request CreateSessionRequest, device Device, baseURL string, now
 		AllowClipboard: request.AllowClipboard,
 		AllowAudio:     request.AllowAudio,
 		StreamProfile:  string(profile),
+		StreamMaxSize:  custom.maxSize,
+		StreamMaxFPS:   custom.maxFPS,
 		IsDemo:         device.IsDemo,
 		ViewerState:    "waiting",
 		ConnectionMode: "not-connected",

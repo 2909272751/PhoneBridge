@@ -1,5 +1,5 @@
 #define AppName "PhoneBridge"
-#define AppVersion "0.1.0"
+#define AppVersion "1.0.0"
 #define AppPublisher "PhoneBridge"
 
 [Setup]
@@ -7,7 +7,12 @@ AppId={{DEB318B0-AC03-49E0-94C4-80F7E50D8399}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
+; First install: use Windows' standard program directory, while keeping the
+; directory page available so every computer may choose another drive.
+; Upgrade: the stable AppId lets Inno Setup discover the previous AppDir and
+; overwrite that installation instead of silently creating a second copy.
 DefaultDirName={autopf}\PhoneBridge
+UsePreviousAppDir=yes
 DefaultGroupName=PhoneBridge
 DisableProgramGroupPage=yes
 OutputDir=..\dist\installer
