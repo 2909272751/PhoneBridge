@@ -1,0 +1,10 @@
+{
+  "component": "scrcpy",
+  "version": "4.1",
+  "platform": "windows-x64",
+  "source": "https://github.com/Genymobile/scrcpy/releases/tag/v4.1",
+  "asset": "scrcpy-win64-v4.1.zip",
+  "sha256": "5b12172b3264b2889f4583ee64752ce832e29bc8b1089dca81093459697165db",
+  "license": "Apache-2.0",
+  "notes": "Downloaded from the official Genymobile release and SHA-256 verified before extraction."
+}

@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>PhoneBridge</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body class="host-body">
+  <div class="host-shell">
+    <aside class="side-nav" aria-label="主导航">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 40 40"><rect x="11" y="4" width="18" height="32" rx="6"/><path d="M17 9h6M18 31h4"/></svg>
+        </span>
+        <span><strong>PhoneBridge</strong><small>手机远程分享</small></span>
+      </div>
+      <nav>
+        <button class="nav-item active" data-view="devices">
+          <span aria-hidden="true">▦</span>设备
+        </button>
+        <button class="nav-item" data-view="sessions">
+          <span aria-hidden="true">◷</span>分享记录
+        </button>
+        <button class="nav-item" data-view="diagnostics">
+          <span aria-hidden="true">⌁</span>连接诊断
+        </button>
+        <button class="nav-item" data-view="settings">
+          <span aria-hidden="true">⚙</span>设置
+        </button>
+      </nav>
+      <div class="side-footer">
+        <span class="status-dot" id="agent-dot"></span>
+        <span><strong id="agent-label">正在启动</strong><small id="version-label">PhoneBridge</small></span>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">设备分享中心</p>
+          <h1 id="page-title">已连接设备</h1>
+        </div>
+        <div class="top-actions">
+          <div class="cloud-pill" id="cloud-pill"><span class="status-dot"></span><span>检查服务</span></div>
+          <button class="icon-button" id="refresh-button" title="刷新设备" aria-label="刷新设备">↻</button>
+        </div>
+      </header>
+
+      <section class="view active" id="view-devices">
+        <div class="demo-banner hidden" id="demo-banner">
+          <strong>演示设备模式</strong>
+          <span>当前画面用于验证产品流程，不代表真实手机视频已经接通。</span>
+        </div>
+
+        <section class="active-session hidden" id="active-session">
+          <div class="session-heading">
+            <div>
+              <span class="live-badge"><i></i>分享进行中</span>
+              <h2 id="active-device-name">Android设备</h2>
+            </div>
+            <div class="countdown" id="session-countdown">--:--</div>
+          </div>
+          <label class="copy-field">
+            <span>分享链接</span>
+            <span class="field-row"><input id="share-url" readonly><button data-copy="share-url">复制链接</button></span>
+          </label>
+          <div class="session-meta">
+            <div><span>访问码</span><strong id="share-code">无需访问码</strong></div>
+            <div><span>访问者</span><strong id="viewer-state">等待加入</strong></div>
+            <div><span>连接方式</span><strong id="connection-mode">尚未连接</strong></div>
+          </div>
+          <div class="session-actions">
+            <button class="button secondary" id="open-controller">在浏览器中预览</button>
+            <button class="button danger" id="stop-session">停止分享</button>
+          </div>
+        </section>
+
+        <div class="section-title-row">
+          <div>
+            <h2>可分享的手机</h2>
+            <p id="adb-message">正在检查ADB设备……</p>
+          </div>
+          <button class="button secondary compact" id="refresh-inline">重新检测</button>
+        </div>
+
+        <div class="device-grid" id="device-grid" aria-live="polite">
+          <div class="device-skeleton"></div>
+        </div>
+
+        <section class="privacy-note">
+          <div class="privacy-icon">✓</div>
+          <div>
+            <strong>只分享所选手机</strong>
+            <p>访问者无法查看电脑桌面、文件或其他ADB设备。原始ADB端口不会暴露到公网。</p>
+          </div>
+        </section>
+      </section>
+
+      <section class="view" id="view-sessions">
+        <div class="empty-panel">
+          <div class="empty-icon">◷</div>
+          <h2>分享记录将在这里显示</h2>
+          <p>正式服务端接入后，这里只保留创建、加入、停止和到期等审计事件，不保存手机画面。</p>
+        </div>
+      </section>
+
+      <section class="view" id="view-diagnostics">
+        <div class="diagnostic-grid">
+          <article class="diagnostic-card">
+            <span>后台Agent</span><strong id="diag-agent">检查中</strong><p>负责ADB、视频和控制通道。</p>
+          </article>
+          <article class="diagnostic-card">
+            <span>ADB</span><strong id="diag-adb">检查中</strong><p id="diag-adb-detail">正在读取设备状态。</p>
+          </article>
+          <article class="diagnostic-card">
+            <span>内置 scrcpy</span><strong id="diag-scrcpy">检查中</strong><p id="diag-scrcpy-detail">正在验证随软件提供的手机流组件。</p>
+          </article>
+          <article class="diagnostic-card">
+            <span>WebRTC / TURN</span><strong class="warning">下一阶段</strong><p>接入后将验证P2P和强制中继回退。</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="view" id="view-settings">
+        <div class="settings-stack">
+          <article class="settings-card">
+            <div><h2>分享期间阻止电脑休眠</h2><p>避免连接因Windows自动休眠而中断。</p></div>
+            <label class="switch"><input type="checkbox" checked disabled><span></span></label>
+          </article>
+          <article class="settings-card">
+            <div><h2>默认分享时长</h2><p>新分享默认使用30分钟，可在开始前修改。</p></div>
+            <select disabled><option>30分钟</option></select>
+          </article>
+          <article class="public-access-card">
+            <div class="settings-heading">
+              <div><h2>公网分享地址</h2><p>分享链接会使用这里的地址。请让 88FRP 仅转发 PhoneBridge 的本机端口 8787，不要转发 ADB 端口。</p></div>
+              <span class="access-state" id="public-access-state">检查中</span>
+            </div>
+            <div class="access-mode" role="radiogroup" aria-label="公网地址来源">
+              <label><input type="radio" name="public-source" value="manual" checked><span>手动填写地址</span></label>
+              <label><input type="radio" name="public-source" value="88frp"><span>从 88FRP 实时同步</span></label>
+            </div>
+            <div class="public-access-fields" id="manual-public-fields">
+              <label>公网地址<input id="manual-public-url" type="url" placeholder="http://公网IP:端口 或 https://域名"></label>
+              <p class="field-hint">例如：<code>http://203.0.113.8:18080</code>。保存后，新的分享链接立即使用该地址。</p>
+            </div>
+            <div class="public-access-fields hidden" id="frp-public-fields">
+              <label>88FRP 本机服务<input id="frp-service-url" type="url" value="http://127.0.0.1:8801"></label>
+              <div class="two-fields">
+                <label>实例<select id="frp-instance"><option value="">先点“同步地址”读取实例</option></select></label>
+                <label>PhoneBridge 隧道<select id="frp-tunnel"><option value="">自动筛选本地端口 8787</option></select></label>
+              </div>
+              <label class="scheme-picker">分享协议<select id="frp-scheme"><option value="http">http</option><option value="https">https</option></select></label>
+              <label class="checkbox-line"><input id="frp-auto-sync" type="checkbox" checked>每 15 秒同步一次最新地址</label>
+              <p class="field-hint">PhoneBridge 只读取已经登录的 88FRP 本机服务，不保存账号或密码。</p>
+            </div>
+            <div class="access-actions">
+              <button class="button secondary" id="sync-public-access" type="button">同步地址</button>
+              <button class="button primary" id="save-public-access" type="button">保存公网设置</button>
+            </div>
+            <p class="access-message" id="public-access-message">正在读取当前设置。</p>
+          </article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog class="share-dialog" id="share-dialog">
+    <form method="dialog" id="share-form">
+      <div class="dialog-header">
+        <div><p class="eyebrow">创建临时会话</p><h2 id="dialog-device-name">分享Android设备</h2></div>
+        <button value="cancel" class="dialog-close" aria-label="关闭">×</button>
+      </div>
+
+      <fieldset>
+        <legend>分享时长</legend>
+        <div class="segment-control" id="duration-control">
+          <label><input type="radio" name="duration" value="15"><span>15分钟</span></label>
+          <label><input type="radio" name="duration" value="30" checked><span>30分钟</span></label>
+          <label><input type="radio" name="duration" value="60"><span>1小时</span></label>
+          <label><input type="radio" name="duration" value="0"><span>不限时</span></label>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>访问权限</legend>
+        <div class="choice-cards">
+          <label><input type="radio" name="mode" value="control" checked><span><strong>查看并控制</strong><small>允许触控、键盘和系统按键</small></span></label>
+          <label><input type="radio" name="mode" value="view"><span><strong>仅查看</strong><small>访问者只能看到手机画面</small></span></label>
+        </div>
+      </fieldset>
+
+      <div class="option-list">
+        <label><span><strong>需要六位访问码</strong><small>避免链接被意外转发后直接加入</small></span><input type="checkbox" id="require-code" checked></label>
+        <label><span><strong>允许访问剪贴板</strong><small>默认关闭，减少敏感内容暴露</small></span><input type="checkbox" id="allow-clipboard"></label>
+        <label><span><strong>共享手机音频</strong><small>真实音频通道将在后续纵切接入</small></span><input type="checkbox" id="allow-audio" disabled></label>
+      </div>
+
+      <p class="form-error hidden" id="share-error"></p>
+      <div class="dialog-actions">
+        <button value="cancel" class="button secondary">取消</button>
+        <button value="default" class="button primary" id="create-share">开始分享</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>
