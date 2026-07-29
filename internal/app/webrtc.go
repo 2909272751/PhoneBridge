@@ -105,6 +105,11 @@ func (server *Server) handleStreamProfile(writer http.ResponseWriter, request *h
 		writeError(writer, http.StatusGone, "会话尚未连接或已经结束")
 		return
 	}
+	if !viewerOwnsSession(request, session) {
+		server.mu.Unlock()
+		writeError(writer, http.StatusConflict, "控制已被新的连接接管")
+		return
+	}
 	previousProfile, previousSize, previousFPS := session.StreamProfile, session.StreamMaxSize, session.StreamMaxFPS
 	session.StreamProfile = profile
 	session.StreamMaxSize, session.StreamMaxFPS = custom.maxSize, custom.maxFPS
@@ -126,6 +131,10 @@ func (server *Server) handleWebRTCConfig(writer http.ResponseWriter, request *ht
 	}
 	if session.ViewerState != "connected" {
 		writeError(writer, http.StatusForbidden, "请先验证访问码并加入会话")
+		return
+	}
+	if !viewerOwnsSession(request, &session) {
+		writeError(writer, http.StatusConflict, "控制已被新的连接接管")
 		return
 	}
 	transportHint := "direct"
@@ -171,10 +180,16 @@ func (server *Server) handleWebRTCOffer(writer http.ResponseWriter, request *htt
 		writeError(writer, http.StatusGone, "会话尚未连接或已结束")
 		return
 	}
+	if !viewerOwnsSession(request, session) {
+		server.mu.Unlock()
+		writeError(writer, http.StatusConflict, "控制已被新的连接接管")
+		return
+	}
 	oldPeer := server.webrtcPeers[session.ID]
 	delete(server.webrtcPeers, session.ID)
 	session.ConnectionMode = "negotiating-webrtc"
 	sessionID := session.ID
+	viewerToken := session.ViewerToken
 	server.mu.Unlock()
 	if oldPeer != nil {
 		oldPeer.close()
@@ -189,7 +204,7 @@ func (server *Server) handleWebRTCOffer(writer http.ResponseWriter, request *htt
 
 	server.mu.Lock()
 	current := server.sessions[sessionID]
-	if current == nil || current.State == "stopped" || current.State == "expired" || current.ViewerState != "connected" {
+	if current == nil || current.State == "stopped" || current.State == "expired" || current.ViewerState != "connected" || current.ViewerToken != viewerToken {
 		server.mu.Unlock()
 		peer.close()
 		writeError(writer, http.StatusGone, "会话已结束")

@@ -30,6 +30,7 @@ type Session struct {
 	StoppedAt      *time.Time `json:"stoppedAt,omitempty"`
 	ShareURL       string     `json:"shareUrl"`
 	LastEventAt    *time.Time `json:"lastEventAt,omitempty"`
+	ViewerToken    string     `json:"-"`
 	pointerStart   *PointerPoint
 }
 

@@ -1,5 +1,5 @@
 #define AppName "PhoneBridge"
-#define AppVersion "1.1.2"
+#define AppVersion "2.0"
 #define AppPublisher "PhoneBridge"
 
 [Setup]
@@ -23,6 +23,7 @@ WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayName=PhoneBridge
+SetupIconFile=..\assets\branding\phonebridge.ico
 
 [Languages]
 Name: "chinesesimp"; MessagesFile: "compiler:Languages\\ChineseSimplified.isl"
@@ -31,12 +32,15 @@ Name: "chinesesimp"; MessagesFile: "compiler:Languages\\ChineseSimplified.isl"
 Source: "..\dist\PhoneBridge\PhoneBridge.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\PhoneBridge\runtime\scrcpy\*"; DestDir: "{app}\runtime\scrcpy"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\README.md"; DestDir: "{app}"; DestName: "README.md"; Flags: ignoreversion
+Source: "..\assets\branding\phonebridge.ico"; DestDir: "{app}"; DestName: "phonebridge.ico"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\PhoneBridge\打开 PhoneBridge"; Filename: "{app}\PhoneBridge.exe"; Parameters: "--open-browser"; WorkingDir: "{app}"
-Name: "{autodesktop}\PhoneBridge"; Filename: "{app}\PhoneBridge.exe"; Parameters: "--open-browser"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autoprograms}\PhoneBridge\打开 PhoneBridge"; Filename: "{app}\PhoneBridge.exe"; Parameters: "--open-browser"; WorkingDir: "{app}"; IconFilename: "{app}\phonebridge.ico"
+Name: "{autodesktop}\PhoneBridge"; Filename: "{app}\PhoneBridge.exe"; Parameters: "--open-browser"; WorkingDir: "{app}"; IconFilename: "{app}\phonebridge.ico"; Tasks: desktopicon
+Name: "{autostartup}\PhoneBridge"; Filename: "{app}\PhoneBridge.exe"; WorkingDir: "{app}"; IconFilename: "{app}\phonebridge.ico"; Comment: "登录 Windows 时在后台启动 PhoneBridge"; Tasks: autostart
 
 [Tasks]
+Name: "autostart"; Description: "登录 Windows 时在后台启动 PhoneBridge"; GroupDescription: "启动选项："; Flags: checkedonce
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加图标："; Flags: unchecked
 
 [Run]
@@ -44,3 +48,24 @@ Filename: "{app}\PhoneBridge.exe"; Parameters: "--open-browser"; WorkingDir: "{a
 
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM PhoneBridge.exe"; Flags: runhidden; RunOnceId: "StopPhoneBridge"
+
+[Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+  InstalledADB: String;
+begin
+  { Stop the old host before files are replaced. Its windowless background
+    process is not always discovered by Restart Manager. }
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM PhoneBridge.exe',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  { Ask the installed ADB client to release port 5037. This avoids killing
+    unrelated applications and prevents adb.exe from locking its own folder. }
+  InstalledADB := ExpandConstant('{app}\runtime\scrcpy\adb.exe');
+  if FileExists(InstalledADB) then
+    Exec(InstalledADB, 'kill-server', ExtractFileDir(InstalledADB),
+      SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(400);
+  Result := '';
+end;

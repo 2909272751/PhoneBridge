@@ -100,6 +100,7 @@ func (controller *adbControlShell) startLocked() error {
 		return nil
 	}
 	command := exec.Command(controller.adbPath, "-s", controller.deviceID, "shell")
+	hideBackgroundProcess(command)
 	command.Stdout = io.Discard
 	command.Stderr = io.Discard
 	stdin, err := command.StdinPipe()

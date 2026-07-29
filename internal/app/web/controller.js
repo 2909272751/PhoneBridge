@@ -2,10 +2,12 @@ const $ = (selector) => document.querySelector(selector);
 const token = window.location.pathname.split("/").filter(Boolean).pop();
 let session = null;
 let joined = false;
+let viewerToken = "";
 let countdownTimer = null;
 let pollTimer = null;
 let pointerDown = false;
 let frameTimer = null;
+let fallbackRunning = false;
 let peerConnection = null;
 let dataChannel = null;
 let webRTCFrame = null;
@@ -26,10 +28,16 @@ let reconnectTimer = null;
 let reconnectAttempts = 0;
 let diagnosticLast = null;
 let webRTCStarting = false;
+// Start every capable browser on the real-time H.264 track. The screenshot
+// renderer remains visible until the first decoded video frame and is only a
+// recovery path; making it the default adds several seconds of visible control
+// latency on a public FRP route.
+let renderMode = "native";
 
 async function api(url, options = {}) {
+  const viewerHeaders = viewerToken ? { "X-PhoneBridge-Viewer": viewerToken } : {};
   const response = await fetch(url, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    headers: { "Content-Type": "application/json", ...viewerHeaders, ...(options.headers || {}) },
     ...options,
   });
   const payload = await response.json().catch(() => ({}));
@@ -74,6 +82,7 @@ async function joinSession(event) {
       body: JSON.stringify({ code }),
     });
     session = result;
+    viewerToken = result.viewerToken || "";
     joined = true;
     showController();
   } catch (error) {
@@ -103,6 +112,7 @@ function showController() {
   $("#demo-screen").classList.toggle("hidden", !session.isDemo);
   $("#device-video").classList.remove("visible");
   $("#fallback-frame").classList.toggle("visible", !session.isDemo);
+  updateRenderModeUI();
   $("#video-placeholder").classList.toggle("hidden", session.isDemo);
   $("#control-status").textContent = session.mode === "control"
     ? "当前由你控制 · 电脑桌面始终不可见"
@@ -112,12 +122,58 @@ function showController() {
   }
   updateCountdown();
   countdownTimer = setInterval(updateCountdown, 1000);
-  pollTimer = setInterval(pollSession, 5000);
+  pollTimer = setInterval(pollSession, 1500);
   if (!session.isDemo) {
     startFallbackFrames();
     void startWebRTC();
   }
   $("#phone-screen").focus();
+}
+
+function updateRenderModeUI() {
+  const button = $("#render-mode-toggle");
+  if (!button) return;
+  const compatibility = renderMode === "compatibility";
+  button.textContent = compatibility ? "低延迟视频" : "兼容画面";
+  button.title = compatibility
+    ? "当前使用兼容画面，点此尝试低延迟 WebRTC 视频"
+    : "当前使用低延迟 WebRTC 视频，点此切回兼容画面";
+}
+
+function useCompatibilityPreview() {
+  renderMode = "compatibility";
+  const video = $("#device-video");
+  video.classList.remove("visible");
+  $("#fallback-frame").classList.add("visible");
+  $("#video-placeholder").classList.remove("hidden");
+  $("#video-placeholder strong").textContent = "正在获取兼容实时画面";
+  $("#video-placeholder small").textContent = "此设备的浏览器将使用兼容画面，控制仍保持实时。";
+  startFallbackFrames();
+  updateRenderModeUI();
+}
+
+function tryNativeVideo() {
+  renderMode = "native";
+  updateRenderModeUI();
+  const video = $("#device-video");
+  $("#video-placeholder").classList.remove("hidden");
+  $("#video-placeholder strong").textContent = "正在尝试低延迟视频";
+  $("#video-placeholder small").textContent = "若画面仍未出现，可点“兼容画面”立即恢复。";
+  video.play().catch(() => {});
+  if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+    showNativeVideo(video);
+  }
+}
+
+function showNativeVideo(video) {
+  if (renderMode !== "native" || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
+  clearTimeout(fallbackPauseTimer);
+  clearTimeout(fallbackRetryTimer);
+  video.classList.add("visible");
+  $("#fallback-frame").classList.remove("visible");
+  $("#video-placeholder").classList.add("hidden");
+  stopFallbackFrames();
+  finishProfileSwitch(true);
 }
 
 async function pollSession() {
@@ -126,6 +182,10 @@ async function pollSession() {
     session = { ...session, ...current };
     hideReconnect();
   } catch (error) {
+    if (error.status === 409) {
+      endSession("此连接已被新的设备接管");
+      return;
+    }
     if (error.status === 404 || error.status === 410) {
       endSession("分享已经结束或到期");
       return;
@@ -151,7 +211,9 @@ async function sendControl(type, detail = {}) {
     });
     if (session.isDemo) animateDemoControl(type, detail);
   } catch (error) {
-    if (error.status === 410) {
+    if (error.status === 409) {
+      endSession("此连接已被新的设备接管");
+    } else if (error.status === 410) {
       endSession("分享已经结束或到期");
     } else {
       showReconnect();
@@ -172,7 +234,6 @@ function setupPhoneInput() {
     pointerDown = true;
 	  pendingPointerMove = null;
     screen.setPointerCapture(event.pointerId);
-    showTouchFeedback(event, screen);
     sendControl("pointer-down", normalizedPoint(event));
   });
   screen.addEventListener("pointermove", (event) => {
@@ -220,16 +281,6 @@ function setupPhoneInput() {
     event.preventDefault();
     sendControl("key", { key: event.key });
   });
-}
-
-function showTouchFeedback(event, screen) {
-  const rect = screen.getBoundingClientRect();
-  const feedback = document.createElement("span");
-  feedback.className = "touch-feedback";
-  feedback.style.left = `${event.clientX - rect.left}px`;
-  feedback.style.top = `${event.clientY - rect.top}px`;
-  screen.append(feedback);
-  setTimeout(() => feedback.remove(), 420);
 }
 
 function setupButtons() {
@@ -479,12 +530,21 @@ function hideReconnect() {
 }
 
 function startFallbackFrames() {
-  if (frameTimer) return;
+  if (fallbackRunning) return;
+  fallbackRunning = true;
   const image = $("#fallback-frame");
   const placeholder = $("#video-placeholder");
+  let stopped = false;
+  const schedule = (delay) => {
+    if (stopped || !joined || frameTimer !== null) return;
+    frameTimer = setTimeout(() => {
+      frameTimer = null;
+      refresh();
+    }, delay);
+  };
   const refresh = () => {
-    if (!joined) return;
-    image.src = `/api/public/sessions/${encodeURIComponent(token)}/frame?r=${Date.now()}`;
+    if (stopped || !joined) return;
+    image.src = `/api/public/sessions/${encodeURIComponent(token)}/frame?viewer=${encodeURIComponent(viewerToken)}&r=${Date.now()}`;
   };
   image.onload = () => {
     placeholder.classList.add("hidden");
@@ -492,21 +552,32 @@ function startFallbackFrames() {
       $("#connection-chip").innerHTML = "<i></i>兼容实时画面";
       $("#latency-chip").textContent = "ADB 低带宽预览";
     }
+    schedule(120);
   };
   image.onerror = () => {
     placeholder.classList.remove("hidden");
     placeholder.querySelector("strong").textContent = "正在重试获取手机画面";
+    schedule(800);
+  };
+  image.dataset.fallbackActive = "true";
+  image._stopFallbackFrames = () => {
+    stopped = true;
   };
   refresh();
-  frameTimer = setInterval(refresh, 550);
 }
 
 function stopFallbackFrames() {
-  clearInterval(frameTimer);
+  const image = $("#fallback-frame");
+  if (typeof image._stopFallbackFrames === "function") image._stopFallbackFrames();
+  delete image._stopFallbackFrames;
+  delete image.dataset.fallbackActive;
+  if (frameTimer !== null) clearTimeout(frameTimer);
   frameTimer = null;
+  fallbackRunning = false;
 }
 
 function prioritizeNativeVideo() {
+  if (renderMode !== "native") return;
   clearTimeout(fallbackPauseTimer);
   clearTimeout(fallbackRetryTimer);
   // Keep a first visual fallback while scrcpy starts, then stop repeated ADB
@@ -563,16 +634,7 @@ async function startWebRTC(recovery = false) {
       video.srcObject = event.streams[0] || new MediaStream([event.track]);
       // Receiving a track is not the same as decoding a frame. Keep the
       // screenshot fallback visible until the native video element has data.
-      const showDecodedVideo = () => {
-        if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
-        clearTimeout(fallbackPauseTimer);
-        clearTimeout(fallbackRetryTimer);
-        video.classList.add("visible");
-        $("#fallback-frame").classList.remove("visible");
-        $("#video-placeholder").classList.add("hidden");
-        stopFallbackFrames();
-        finishProfileSwitch(true);
-      };
+      const showDecodedVideo = () => showNativeVideo(video);
       video.onloadeddata = showDecodedVideo;
       video.onplaying = showDecodedVideo;
       video.play().then(showDecodedVideo).catch(() => {});
@@ -596,7 +658,11 @@ async function startWebRTC(recovery = false) {
       body: JSON.stringify(connection.localDescription),
     });
     if (peerConnection === connection) await connection.setRemoteDescription(answer);
-  } catch {
+  } catch (error) {
+    if (error.status === 409) {
+      endSession("此连接已被新的设备接管");
+      return;
+    }
     // Fallback frames keep the controller usable when ICE/TURN is unavailable.
     startFallbackFrames();
     if (recovery || joined) scheduleWebRTCRecovery();
@@ -745,6 +811,13 @@ document.addEventListener("DOMContentLoaded", () => {
     $("#stream-profile").value = "smooth";
     $("#custom-profile").classList.add("hidden");
     applyStreamProfile("smooth", false);
+  });
+  $("#render-mode-toggle").addEventListener("click", () => {
+    if (renderMode === "compatibility") {
+      tryNativeVideo();
+    } else {
+      useCompatibilityPreview();
+    }
   });
   setupPhoneInput();
   setupButtons();

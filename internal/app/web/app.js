@@ -14,7 +14,7 @@ async function api(url, options = {}) {
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(payload.error || `请求失败（${response.status}）`);
+    throw new Error(payload.error || payload.message || `请求失败（${response.status}）`);
   }
   return payload;
 }
@@ -42,6 +42,30 @@ async function refreshDevices() {
     await loadStatus(true);
   } catch (error) {
     showToast(error.message, true);
+  }
+}
+
+async function repairADB() {
+  const button = $("#repair-adb");
+  const refreshButton = $("#refresh-inline");
+  const hasConnectedDevice = state.status?.adb?.available && (state.status.adb.devices || []).length > 0;
+  if (hasConnectedDevice && !window.confirm("修复 ADB 会短暂中断当前手机画面并重新连接，是否继续？")) {
+    return;
+  }
+  button.disabled = true;
+  refreshButton.disabled = true;
+  button.textContent = "正在接管 ADB…";
+  $("#adb-message").textContent = "正在停止冲突服务并启动 PhoneBridge 内置 ADB…";
+  try {
+    const result = await api("/api/devices/repair-adb", { method: "POST", body: "{}" });
+    showToast(result.message);
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    button.disabled = false;
+    refreshButton.disabled = false;
+    button.textContent = "修复 ADB";
+    await loadStatus(true);
   }
 }
 
@@ -400,6 +424,7 @@ document.addEventListener("DOMContentLoaded", () => {
   setupPublicAccess();
   $("#refresh-button").addEventListener("click", refreshDevices);
   $("#refresh-inline").addEventListener("click", refreshDevices);
+  $("#repair-adb").addEventListener("click", repairADB);
   $("#check-update").addEventListener("click", checkForUpdate);
   $("#share-form").addEventListener("submit", createShare);
   loadStatus();

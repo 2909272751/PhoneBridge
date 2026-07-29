@@ -51,7 +51,9 @@ func scrcpyCandidates(explicitPath string) []string {
 func inspectScrcpy(path string) ScrcpySnapshot {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	output, err := exec.CommandContext(ctx, path, "--version").CombinedOutput()
+	command := exec.CommandContext(ctx, path, "--version")
+	hideBackgroundProcess(command)
+	output, err := command.CombinedOutput()
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 	version := ""
 	if len(lines) > 0 {

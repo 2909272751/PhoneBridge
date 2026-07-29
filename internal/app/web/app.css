@@ -36,7 +36,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   border-radius: 13px; background: linear-gradient(145deg, #5d8fff, #2b65ed);
   box-shadow: 0 10px 24px rgba(35, 100, 238, .28);
 }
-.brand-mark svg { width: 30px; height: 30px; fill: none; stroke: #fff; stroke-width: 2; }
+.brand-mark img { display: block; width: 34px; height: 34px; object-fit: contain; }
 .brand strong { display: block; font-size: 17px; letter-spacing: -.2px; }
 .brand small { display: block; margin-top: 2px; color: #9da9bf; font-size: 11px; }
 .side-nav nav { display: grid; gap: 7px; margin-top: 38px; }
@@ -103,6 +103,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .section-title-row { display: flex; justify-content: space-between; align-items: flex-end; gap: 20px; margin: 0 0 15px; }
 .section-title-row h2 { margin: 0; font-size: 18px; letter-spacing: -.3px; }
 .section-title-row p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
+.device-actions { display: flex; align-items: center; gap: 8px; }
 .button { min-height: 40px; padding: 0 17px; border-radius: 10px; border: 1px solid transparent; font-size: 12px; font-weight: 700; transition: transform .15s, box-shadow .15s, border-color .15s; }
 .button:hover:not(:disabled) { transform: translateY(-1px); }
 .button.primary { color: #fff; background: linear-gradient(135deg, #3978ff, #245fdf); box-shadow: 0 9px 20px rgba(47,109,246,.2); }
@@ -396,9 +397,6 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .system-buttons button { width: 27px; height: 27px; }
 }
 
-/* v1.1 live diagnostics and immediate touch acknowledgement. */
-.touch-feedback { position: absolute; z-index: 8; width: 34px; height: 34px; margin: -17px 0 0 -17px; border: 2px solid rgba(120,166,255,.95); border-radius: 50%; pointer-events: none; animation: phonebridge-touch .42s ease-out forwards; }
-@keyframes phonebridge-touch { from { transform: scale(.35); opacity: .95; } to { transform: scale(1.45); opacity: 0; } }
 .network-diagnostics { width: min(660px, calc(100% - 20px)); margin: 0 auto 12px; padding: 9px 12px; border: 1px solid rgba(123,151,205,.28); border-radius: 12px; background: rgba(10,20,39,.82); color: #aebbd2; font-size: 11px; }
 .network-diagnostics summary { cursor: pointer; display: flex; justify-content: space-between; gap: 12px; font-weight: 750; color: #e7efff; }
 .network-diagnostics summary span { color: #7de0b0; font-weight: 650; }

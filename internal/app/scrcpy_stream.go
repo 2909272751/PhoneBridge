@@ -157,6 +157,7 @@ func startScrcpyVideoStream(parent context.Context, adbPath, deviceID, serverPat
 
 	const remoteServer = "/data/local/tmp/phonebridge-scrcpy-server-4.1.jar"
 	push := exec.CommandContext(ctx, adbPath, "-s", deviceID, "push", serverPath, remoteServer)
+	hideBackgroundProcess(push)
 	if output, err := push.CombinedOutput(); err != nil {
 		return cleanup(fmt.Errorf("无法准备内置 scrcpy 服务：%s", commandMessage(err, output)))
 	}
@@ -168,6 +169,7 @@ func startScrcpyVideoStream(parent context.Context, adbPath, deviceID, serverPat
 	scid := binary.BigEndian.Uint32(randomID[:]) & 0x7fffffff
 	socketName := fmt.Sprintf("scrcpy_%08x", scid)
 	forward := exec.CommandContext(ctx, adbPath, "-s", deviceID, "forward", "tcp:0", "localabstract:"+socketName)
+	hideBackgroundProcess(forward)
 	output, err := forward.CombinedOutput()
 	if err != nil {
 		return cleanup(fmt.Errorf("无法建立 scrcpy 本机视频通道：%s", commandMessage(err, output)))
@@ -192,6 +194,7 @@ func startScrcpyVideoStream(parent context.Context, adbPath, deviceID, serverPat
 		"cleanup=true",
 	}
 	stream.command = exec.CommandContext(ctx, adbPath, args...)
+	hideBackgroundProcess(stream.command)
 	stream.command.Stdout = &stream.output
 	stream.command.Stderr = &stream.output
 	if err := stream.command.Start(); err != nil {
@@ -296,7 +299,9 @@ func (stream *scrcpyVideoStream) close() {
 	}
 	stream.controlMu.Unlock()
 	if stream.port != 0 && stream.adbPath != "" && stream.deviceID != "" {
-		_ = exec.Command(stream.adbPath, "-s", stream.deviceID, "forward", "--remove", "tcp:"+strconv.Itoa(stream.port)).Run()
+		command := exec.Command(stream.adbPath, "-s", stream.deviceID, "forward", "--remove", "tcp:"+strconv.Itoa(stream.port))
+		hideBackgroundProcess(command)
+		_ = command.Run()
 		stream.port = 0
 	}
 }

@@ -26,7 +26,7 @@ import (
 //go:embed web/*
 var embeddedWeb embed.FS
 
-const version = "1.1.2"
+const version = "2.0"
 
 type Config struct {
 	ListenAddress string
@@ -61,6 +61,7 @@ type Server struct {
 	icePublicPort    int
 	sessionStorePath string
 	controlMu        sync.Mutex
+	adbRepairMu      sync.Mutex
 	controllers      map[string]*adbControlShell
 }
 
@@ -186,6 +187,7 @@ func (server *Server) routes() (http.Handler, error) {
 	mux.HandleFunc("PUT /api/public-access", server.handleSavePublicAccess)
 	mux.HandleFunc("POST /api/public-access/sync", server.handleSyncPublicAccess)
 	mux.HandleFunc("POST /api/devices/refresh", server.handleRefreshDevices)
+	mux.HandleFunc("POST /api/devices/repair-adb", server.handleRepairADB)
 	mux.HandleFunc("POST /api/sessions", server.handleCreateSession)
 	mux.HandleFunc("GET /api/sessions/current", server.handleCurrentSession)
 	mux.HandleFunc("POST /api/sessions/{id}/stop", server.handleStopSession)
@@ -309,6 +311,30 @@ func (server *Server) handleRefreshDevices(writer http.ResponseWriter, request *
 	writeJSON(writer, http.StatusOK, snapshot)
 }
 
+func (server *Server) handleRepairADB(writer http.ResponseWriter, request *http.Request) {
+	server.adbRepairMu.Lock()
+	defer server.adbRepairMu.Unlock()
+	server.closeControlShells()
+	result := repairADB(request.Context(), server.config.ADBPath, server.config.DemoMode)
+	server.mu.Lock()
+	server.adb = result.Snapshot
+	server.mu.Unlock()
+	status := http.StatusOK
+	if !result.Success {
+		status = http.StatusBadGateway
+	}
+	writeJSON(writer, status, result)
+}
+
+func isLocalHost(host string) bool {
+	name := host
+	if parsed, _, err := net.SplitHostPort(host); err == nil {
+		name = parsed
+	}
+	name = strings.Trim(strings.ToLower(name), "[]")
+	return name == "127.0.0.1" || name == "localhost" || name == "::1"
+}
+
 func (server *Server) handleCreateSession(writer http.ResponseWriter, request *http.Request) {
 	var input CreateSessionRequest
 	if err := decodeJSON(request, &input); err != nil {
@@ -418,6 +444,10 @@ func (server *Server) handlePublicSession(writer http.ResponseWriter, request *h
 		writeError(writer, http.StatusNotFound, "分享链接无效或已经结束")
 		return
 	}
+	if suppliedViewerToken(request) != "" && !viewerOwnsSession(request, &session) {
+		writeError(writer, http.StatusConflict, "控制已被新的连接接管")
+		return
+	}
 	writeJSON(writer, http.StatusOK, publicGuestSession(session, false))
 }
 
@@ -431,23 +461,35 @@ func (server *Server) handleJoinSession(writer http.ResponseWriter, request *htt
 	}
 
 	token := request.PathValue("token")
+	viewerToken, err := randomToken(18)
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, "无法建立控制连接")
+		return
+	}
 	server.mu.Lock()
-	defer server.mu.Unlock()
 	session, ok := server.sessionByTokenLocked(token, time.Now())
 	if !ok {
+		server.mu.Unlock()
 		writeError(writer, http.StatusGone, "分享链接已失效")
 		return
 	}
 	if session.RequireCode && strings.TrimSpace(input.Code) != session.AccessCode {
+		server.mu.Unlock()
 		writeError(writer, http.StatusUnauthorized, "访问码不正确")
 		return
 	}
-	// A browser refresh, mobile background resume, or switching networks must
-	// not consume the single-controller slot forever. The latest holder of the
-	// secret link replaces the old WebRTC peer when it sends a new offer.
-	if session.ViewerState == "connected" {
-		writeJSON(writer, http.StatusOK, publicGuestSession(*session, true))
-		return
+	oldPeer := server.webrtcPeers[session.ID]
+	delete(server.webrtcPeers, session.ID)
+	session.ViewerToken = viewerToken
+	// Joining is also the recovery path after a browser refresh, a network
+	// switch, or Android returning from the background. Wake the shared phone
+	// on every valid join, including joins to an already-connected session.
+	if !session.IsDemo {
+		deviceID := session.DeviceID
+		go func() {
+			disableTouchDebugOverlays(context.Background(), server.config.ADBPath, deviceID)
+			_ = wakeDevice(context.Background(), server.config.ADBPath, deviceID)
+		}()
 	}
 	session.ViewerState = "connected"
 	session.State = "connected"
@@ -455,16 +497,14 @@ func (server *Server) handleJoinSession(writer http.ResponseWriter, request *htt
 		session.ConnectionMode = "demo"
 	} else {
 		session.ConnectionMode = "fallback-screen"
-		// The first fallback frame is a direct Android screenshot. Wake the
-		// USB-connected phone so that a sleeping display is not sent as a
-		// perfectly valid, but completely black, PNG to the remote viewer.
-		deviceID := session.DeviceID
-		go func() {
-			_ = wakeDevice(context.Background(), server.config.ADBPath, deviceID)
-		}()
 	}
 	server.persistSessionsLocked()
-	writeJSON(writer, http.StatusOK, publicGuestSession(*session, true))
+	response := publicGuestSession(*session, true)
+	server.mu.Unlock()
+	if oldPeer != nil {
+		oldPeer.close()
+	}
+	writeJSON(writer, http.StatusOK, response)
 }
 
 func (server *Server) handleControlEvent(writer http.ResponseWriter, request *http.Request) {
@@ -488,6 +528,11 @@ func (server *Server) handleControlEvent(writer http.ResponseWriter, request *ht
 	if session.ViewerState != "connected" || session.Mode != "control" {
 		server.mu.Unlock()
 		writeError(writer, http.StatusForbidden, "当前会话没有控制权限")
+		return
+	}
+	if !viewerOwnsSession(request, session) {
+		server.mu.Unlock()
+		writeError(writer, http.StatusConflict, "控制已被新的连接接管")
 		return
 	}
 	now := time.Now()
@@ -530,6 +575,11 @@ func (server *Server) handleFrame(writer http.ResponseWriter, request *http.Requ
 	if session.ViewerState != "connected" {
 		server.mu.Unlock()
 		writeError(writer, http.StatusForbidden, "当前浏览器尚未加入会话")
+		return
+	}
+	if !viewerOwnsSession(request, session) {
+		server.mu.Unlock()
+		writeError(writer, http.StatusConflict, "控制已被新的连接接管")
 		return
 	}
 	deviceID, demo := session.DeviceID, session.IsDemo
@@ -616,7 +666,21 @@ func publicGuestSession(session Session, joined bool) map[string]any {
 		"expiresAt":      session.ExpiresAt,
 		"joined":         joined,
 	}
+	if joined {
+		response["viewerToken"] = session.ViewerToken
+	}
 	return response
+}
+
+func suppliedViewerToken(request *http.Request) string {
+	if value := strings.TrimSpace(request.Header.Get("X-PhoneBridge-Viewer")); value != "" {
+		return value
+	}
+	return strings.TrimSpace(request.URL.Query().Get("viewer"))
+}
+
+func viewerOwnsSession(request *http.Request, session *Session) bool {
+	return session != nil && session.ViewerToken != "" && suppliedViewerToken(request) == session.ViewerToken
 }
 
 func requestOrigin(request *http.Request) string {

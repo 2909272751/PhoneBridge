@@ -33,7 +33,9 @@ type ScreenSize struct {
 func deviceScreenSize(ctx context.Context, adbPath, deviceID string) (ScreenSize, error) {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	output, err := exec.CommandContext(ctx, adbPath, "-s", deviceID, "shell", "wm", "size").CombinedOutput()
+	command := exec.CommandContext(ctx, adbPath, "-s", deviceID, "shell", "wm", "size")
+	hideBackgroundProcess(command)
+	output, err := command.CombinedOutput()
 	if err != nil {
 		return ScreenSize{}, fmt.Errorf("无法读取手机屏幕尺寸：%w", err)
 	}
@@ -53,7 +55,9 @@ func deviceScreenSize(ctx context.Context, adbPath, deviceID string) (ScreenSize
 func deviceScreenshot(ctx context.Context, adbPath, deviceID string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
-	output, err := exec.CommandContext(ctx, adbPath, "-s", deviceID, "exec-out", "screencap", "-p").Output()
+	command := exec.CommandContext(ctx, adbPath, "-s", deviceID, "exec-out", "screencap", "-p")
+	hideBackgroundProcess(command)
+	output, err := command.Output()
 	if err != nil {
 		return nil, fmt.Errorf("无法获取手机画面：%w", err)
 	}
@@ -68,6 +72,18 @@ func deviceScreenshot(ctx context.Context, adbPath, deviceID string) ([]byte, er
 // screenshot when Android has turned the display off.
 func wakeDevice(ctx context.Context, adbPath, deviceID string) error {
 	return adbInput(ctx, adbPath, deviceID, "keyevent", "224")
+}
+
+// disableTouchDebugOverlays removes Android developer overlays that draw
+// circles, trails, and coordinates over every injected remote touch.
+func disableTouchDebugOverlays(ctx context.Context, adbPath, deviceID string) {
+	for _, setting := range []string{"show_touches", "pointer_location"} {
+		commandContext, cancel := context.WithTimeout(ctx, 3*time.Second)
+		command := exec.CommandContext(commandContext, adbPath, "-s", deviceID, "shell", "settings", "put", "system", setting, "0")
+		hideBackgroundProcess(command)
+		_ = command.Run()
+		cancel()
+	}
 }
 
 func devicePreview(ctx context.Context, adbPath, deviceID string) ([]byte, string, error) {
@@ -108,7 +124,9 @@ func adbInput(ctx context.Context, adbPath, deviceID string, input ...string) er
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	arguments := append([]string{"-s", deviceID, "shell", "input"}, input...)
-	output, err := exec.CommandContext(ctx, adbPath, arguments...).CombinedOutput()
+	command := exec.CommandContext(ctx, adbPath, arguments...)
+	hideBackgroundProcess(command)
+	output, err := command.CombinedOutput()
 	if err != nil {
 		message := strings.TrimSpace(string(output))
 		if message == "" {
@@ -131,10 +149,13 @@ type Device struct {
 }
 
 func discoverADB(ctx context.Context, adbPath string, demo bool) ADBSnapshot {
-	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	// A cold Windows ADB server may need several seconds to initialise USB
+	// drivers. Once the daemon is warm this command still returns immediately.
+	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, adbPath, "devices", "-l")
+	hideBackgroundProcess(cmd)
 	output, err := cmd.CombinedOutput()
 	now := time.Now()
 	if err != nil {
