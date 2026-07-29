@@ -14,6 +14,7 @@ let fallbackPauseTimer = null;
 let fallbackRetryTimer = null;
 let selectedProfile = "hd";
 let transportHint = "direct";
+let directProbe = false;
 let transportMonitorTimer = null;
 let transportLastBytes = null;
 let transportLastAt = null;
@@ -21,6 +22,10 @@ let pendingPointerMove = null;
 let pointerMoveTimer = null;
 let profileSwitchTimer = null;
 let profileSwitching = false;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+let diagnosticLast = null;
+let webRTCStarting = false;
 
 async function api(url, options = {}) {
   const response = await fetch(url, {
@@ -167,6 +172,7 @@ function setupPhoneInput() {
     pointerDown = true;
 	  pendingPointerMove = null;
     screen.setPointerCapture(event.pointerId);
+    showTouchFeedback(event, screen);
     sendControl("pointer-down", normalizedPoint(event));
   });
   screen.addEventListener("pointermove", (event) => {
@@ -214,6 +220,16 @@ function setupPhoneInput() {
     event.preventDefault();
     sendControl("key", { key: event.key });
   });
+}
+
+function showTouchFeedback(event, screen) {
+  const rect = screen.getBoundingClientRect();
+  const feedback = document.createElement("span");
+  feedback.className = "touch-feedback";
+  feedback.style.left = `${event.clientX - rect.left}px`;
+  feedback.style.top = `${event.clientY - rect.top}px`;
+  screen.append(feedback);
+  setTimeout(() => feedback.remove(), 420);
 }
 
 function setupButtons() {
@@ -301,6 +317,12 @@ function updateTransportIndicator(reports, pair, rtt) {
   else if (local?.candidateType === "host" && remote?.candidateType === "host") path = "局域网直连";
   const delay = rtt > 0 ? ` · ${Math.round(rtt * 1000)}ms` : "";
   $("#latency-chip").textContent = path + delay;
+  // The browser sees the server candidate as "remote". A server srflx
+  // candidate is its real NAT mapping; the FRP UDP advertisement is a host
+  // candidate whose public port is rewritten before the answer is sent.
+  const diagnosticPath = usesTURN ? "TURN 中继" : remote?.candidateType === "srflx" ? "公网 UDP 直连" : transportHint === "frp-udp" ? "88FRP UDP 中继" : local?.candidateType === "host" && remote?.candidateType === "host" ? "局域网直连" : "WebRTC UDP";
+  $("#latency-chip").textContent = diagnosticPath + delay;
+  $("#diagnostic-path").textContent = diagnosticPath;
 }
 
 function renderTransferSpeed(reports) {
@@ -324,6 +346,24 @@ function renderTransferSpeed(reports) {
   const chip = $("#latency-chip");
   chip.dataset.speed = label;
   if (!chip.textContent.includes(label)) chip.textContent = `${chip.textContent.replace(/ · [\d.]+ (?:M|K)bps$/, "")} · ${label}`;
+
+  const packets = Number(inbound.packetsReceived || 0);
+  const lost = Math.max(0, Number(inbound.packetsLost || 0));
+  const loss = packets + lost > 0 ? lost * 100 / (packets + lost) : 0;
+  const jitter = Number(inbound.jitter || 0) * 1000;
+  const decoded = Number(inbound.framesDecoded || 0);
+  let fps = 0;
+  if (diagnosticLast && now > diagnosticLast.at) fps = Math.max(0, (decoded - diagnosticLast.decoded) * 1000 / (now - diagnosticLast.at));
+  diagnosticLast = { at: now, decoded };
+  const rtt = Number(reports.__phoneBridgeRTT || 0) * 1000;
+  $("#diagnostic-rtt").textContent = rtt > 0 ? `${Math.round(rtt)}ms` : "--";
+  $("#diagnostic-quality").textContent = `${Math.round(jitter)}ms / ${loss.toFixed(1)}%`;
+  $("#diagnostic-video").textContent = `${label} / ${fps.toFixed(0)}fps`;
+  const warning = loss > 3 || rtt > 260 || jitter > 45 || (decoded > 5 && fps > 0 && fps < 8);
+  $("#network-summary").textContent = warning ? "网络波动" : "传输正常";
+  $("#network-advice").textContent = warning
+    ? "检测到弱网。画质不会自动变化；可点击“流畅”切到 360p / 10fps，或在顶部手动选择档位。"
+    : "当前为实时测量结果；显示“公网 UDP 直连”才表示浏览器未经过 88FRP 视频中继。";
 }
 
 function startTransportMonitor() {
@@ -338,7 +378,8 @@ function startTransportMonitor() {
     reports.forEach((report) => {
       if (report.type === "candidate-pair" && report.state === "succeeded" && (report.nominated || !pair)) pair = report;
     });
-    updateTransportIndicator(reports, pair, pair?.currentRoundTripTime || 0);
+    reports.__phoneBridgeRTT = pair?.currentRoundTripTime || 0;
+    updateTransportIndicator(reports, pair, reports.__phoneBridgeRTT);
     renderTransferSpeed(reports);
   }, 1000);
 }
@@ -348,7 +389,24 @@ function stopTransportMonitor() {
   transportMonitorTimer = null;
   transportLastBytes = null;
   transportLastAt = null;
+  diagnosticLast = null;
   $("#mobile-transport").textContent = "传输 --";
+}
+
+function scheduleWebRTCRecovery() {
+  if (!joined || session?.isDemo || reconnectTimer) return;
+  if (reconnectAttempts >= 3) {
+    $("#stage-message-title").textContent = "视频通道暂不可用";
+    $("#stage-message-detail").textContent = "已保留兼容预览；请稍后点击刷新或重新打开分享链接。";
+    return;
+  }
+  reconnectAttempts += 1;
+  const delay = Math.min(8000, 700 * (2 ** Math.min(reconnectAttempts - 1, 3)));
+  $("#stage-message-detail").textContent = `正在重新协商视频通道（第 ${reconnectAttempts} 次，约 ${Math.ceil(delay / 1000)} 秒）`;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (joined) void startWebRTC(true);
+  }, delay);
 }
 
 function tuneReceiverBuffer(profile) {
@@ -463,28 +521,42 @@ function prioritizeNativeVideo() {
   }, 3000);
 }
 
-async function startWebRTC() {
+async function startWebRTC(recovery = false) {
+  if (webRTCStarting) return;
+  webRTCStarting = true;
   try {
     const config = await api(`/api/public/sessions/${encodeURIComponent(token)}/webrtc/config`);
     transportHint = config.transportHint || "direct";
-    peerConnection?.close();
-    peerConnection = new RTCPeerConnection({ iceServers: config.iceServers || [] });
-    peerConnection.addTransceiver("video", { direction: "recvonly" });
-    dataChannel = peerConnection.createDataChannel("phonebridge", { ordered: true });
+    directProbe = Boolean(config.directProbe);
+    const previousConnection = peerConnection;
+    peerConnection = null;
+    previousConnection?.close();
+    const connection = new RTCPeerConnection({ iceServers: config.iceServers || [] });
+    peerConnection = connection;
+    connection.addTransceiver("video", { direction: "recvonly" });
+    dataChannel = connection.createDataChannel("phonebridge", { ordered: true });
     dataChannel.binaryType = "arraybuffer";
     dataChannel.onopen = () => {
+      if (peerConnection !== connection) return;
+      reconnectAttempts = 0;
       $("#connection-chip").innerHTML = "<i></i>WebRTC 已连接";
       $("#latency-chip").textContent = transportHint === "frp-udp" ? "FRP UDP 探测中" : "WebRTC 探测中";
       prioritizeNativeVideo();
       startTransportMonitor();
     };
     dataChannel.onclose = () => {
+      if (peerConnection !== connection) return;
       dataChannel = null;
       stopTransportMonitor();
-      if (joined) startFallbackFrames();
+      if (joined) {
+        startFallbackFrames();
+        showReconnect();
+        scheduleWebRTCRecovery();
+      }
     };
     dataChannel.onmessage = receiveWebRTCMessage;
-    peerConnection.ontrack = (event) => {
+    connection.ontrack = (event) => {
+      if (peerConnection !== connection) return;
       if (event.track.kind !== "video") return;
       tuneReceiverBuffer(selectedProfile);
       const video = $("#device-video");
@@ -507,32 +579,36 @@ async function startWebRTC() {
       $("#connection-chip").innerHTML = "<i></i>低延迟视频";
       $("#latency-chip").textContent = "scrcpy H.264 / WebRTC";
     };
-    peerConnection.onconnectionstatechange = () => {
-      if (!peerConnection) return;
-      if (peerConnection.connectionState === "failed" || peerConnection.connectionState === "disconnected") {
+    connection.onconnectionstatechange = () => {
+      if (peerConnection !== connection) return;
+      if (connection.connectionState === "failed" || connection.connectionState === "disconnected") {
         showReconnect();
         startFallbackFrames();
+        scheduleWebRTCRecovery();
       }
     };
 
-    const offer = await peerConnection.createOffer();
-    await peerConnection.setLocalDescription(offer);
-    await waitForIceGathering(peerConnection);
+    const offer = await connection.createOffer();
+    await connection.setLocalDescription(offer);
+    await waitForIceGathering(connection, directProbe ? 5000 : 10000);
     const answer = await api(`/api/public/sessions/${encodeURIComponent(token)}/webrtc/offer`, {
       method: "POST",
-      body: JSON.stringify(peerConnection.localDescription),
+      body: JSON.stringify(connection.localDescription),
     });
-    await peerConnection.setRemoteDescription(answer);
+    if (peerConnection === connection) await connection.setRemoteDescription(answer);
   } catch {
     // Fallback frames keep the controller usable when ICE/TURN is unavailable.
     startFallbackFrames();
+    if (recovery || joined) scheduleWebRTCRecovery();
+  } finally {
+    webRTCStarting = false;
   }
 }
 
-function waitForIceGathering(connection) {
+function waitForIceGathering(connection, timeoutMilliseconds = 1800) {
   if (connection.iceGatheringState === "complete") return Promise.resolve();
   return new Promise((resolve) => {
-    const timeout = setTimeout(done, 10000);
+    const timeout = setTimeout(done, timeoutMilliseconds);
     function done() {
       clearTimeout(timeout);
       connection.removeEventListener("icegatheringstatechange", onChange);
@@ -605,6 +681,8 @@ function endSession(message) {
   clearInterval(pollTimer);
   clearTimeout(fallbackPauseTimer);
   clearTimeout(fallbackRetryTimer);
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
   stopTransportMonitor();
   stopFallbackFrames();
   peerConnection?.close();
@@ -662,6 +740,11 @@ document.addEventListener("DOMContentLoaded", () => {
     const maxFps = Number($("#custom-fps").value);
     applyStreamProfile("custom", true, { maxSize, maxFps });
     $("#custom-profile").classList.add("hidden");
+  });
+  $("#quick-smooth").addEventListener("click", () => {
+    $("#stream-profile").value = "smooth";
+    $("#custom-profile").classList.add("hidden");
+    applyStreamProfile("smooth", false);
   });
   setupPhoneInput();
   setupButtons();

@@ -395,3 +395,19 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .system-buttons { gap: 3px; }
   .system-buttons button { width: 27px; height: 27px; }
 }
+
+/* v1.1 live diagnostics and immediate touch acknowledgement. */
+.touch-feedback { position: absolute; z-index: 8; width: 34px; height: 34px; margin: -17px 0 0 -17px; border: 2px solid rgba(120,166,255,.95); border-radius: 50%; pointer-events: none; animation: phonebridge-touch .42s ease-out forwards; }
+@keyframes phonebridge-touch { from { transform: scale(.35); opacity: .95; } to { transform: scale(1.45); opacity: 0; } }
+.network-diagnostics { width: min(660px, calc(100% - 20px)); margin: 0 auto 12px; padding: 9px 12px; border: 1px solid rgba(123,151,205,.28); border-radius: 12px; background: rgba(10,20,39,.82); color: #aebbd2; font-size: 11px; }
+.network-diagnostics summary { cursor: pointer; display: flex; justify-content: space-between; gap: 12px; font-weight: 750; color: #e7efff; }
+.network-diagnostics summary span { color: #7de0b0; font-weight: 650; }
+.network-diagnostic-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; margin-top: 10px; }
+.network-diagnostic-grid span { display: grid; gap: 2px; color: #8796b0; }
+.network-diagnostic-grid strong { overflow: hidden; color: #dbe7fb; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; }
+.network-diagnostics p { margin: 10px 0 0; color: #94a8c5; line-height: 1.45; }
+.quick-smooth { display: none; }
+@media (max-width: 620px) {
+  .quick-smooth { display: inline-flex; height: 34px; padding: 0 9px; align-items: center; border: 1px solid #416fdb; border-radius: 9px; background: #16213a; color: #b7ceff; font-size: 11px; font-weight: 750; }
+  .network-diagnostics { width: calc(100% - 14px); margin-bottom: 8px; font-size: 10px; }
+}

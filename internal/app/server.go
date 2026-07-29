@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,7 +26,7 @@ import (
 //go:embed web/*
 var embeddedWeb embed.FS
 
-const version = "1.0.0"
+const version = "1.1.2"
 
 type Config struct {
 	ListenAddress string
@@ -45,21 +46,22 @@ type ICEServerConfig struct {
 }
 
 type Server struct {
-	config        Config
-	logger        *log.Logger
-	mu            sync.RWMutex
-	adb           ADBSnapshot
-	scrcpy        ScrcpySnapshot
-	sessions      map[string]*Session
-	sessionToken  map[string]string
-	webrtcPeers   map[string]*webRTCPeer
-	activeID      string
-	publicAccess  *PublicAccessManager
-	webRTCAPI     *pion.API
-	iceConn       *net.UDPConn
-	icePublicPort int
-	controlMu     sync.Mutex
-	controllers   map[string]*adbControlShell
+	config           Config
+	logger           *log.Logger
+	mu               sync.RWMutex
+	adb              ADBSnapshot
+	scrcpy           ScrcpySnapshot
+	sessions         map[string]*Session
+	sessionToken     map[string]string
+	webrtcPeers      map[string]*webRTCPeer
+	activeID         string
+	publicAccess     *PublicAccessManager
+	webRTCAPI        *pion.API
+	iceConn          *net.UDPConn
+	icePublicPort    int
+	sessionStorePath string
+	controlMu        sync.Mutex
+	controllers      map[string]*adbControlShell
 }
 
 func New(config Config, logger *log.Logger) *Server {
@@ -76,15 +78,27 @@ func New(config Config, logger *log.Logger) *Server {
 	if config.SettingsPath == "" {
 		config.SettingsPath = defaultSettingsPath()
 	}
+	sessionStorePath := filepath.Join(filepath.Dir(config.SettingsPath), "sessions.json")
+	sessions, sessionToken, activeID := loadSessionStore(sessionStorePath, time.Now())
 	return &Server{
-		config:       config,
-		logger:       logger,
-		scrcpy:       scrcpy,
-		sessions:     make(map[string]*Session),
-		sessionToken: make(map[string]string),
-		webrtcPeers:  make(map[string]*webRTCPeer),
-		controllers:  make(map[string]*adbControlShell),
-		publicAccess: NewPublicAccessManager(config.SettingsPath, config.PublicBaseURL, listenPort(config.ListenAddress), logger),
+		config:           config,
+		logger:           logger,
+		scrcpy:           scrcpy,
+		sessions:         sessions,
+		sessionToken:     sessionToken,
+		activeID:         activeID,
+		sessionStorePath: sessionStorePath,
+		webrtcPeers:      make(map[string]*webRTCPeer),
+		controllers:      make(map[string]*adbControlShell),
+		publicAccess:     NewPublicAccessManager(config.SettingsPath, config.PublicBaseURL, listenPort(config.ListenAddress), logger),
+	}
+}
+
+// persistSessionsLocked is best-effort. A transient disk error must never
+// terminate a live phone-control session.
+func (server *Server) persistSessionsLocked() {
+	if err := saveSessionStore(server.sessionStorePath, server.activeID, server.sessions); err != nil {
+		server.logger.Printf("persisting share sessions: %v", err)
 	}
 }
 
@@ -167,6 +181,7 @@ func (server *Server) routes() (http.Handler, error) {
 	mux.Handle("GET /assets/", http.StripPrefix("/assets/", fileServer))
 	mux.HandleFunc("GET /healthz", server.handleHealth)
 	mux.HandleFunc("GET /api/status", server.handleStatus)
+	mux.HandleFunc("GET /api/update", server.handleUpdateCheck)
 	mux.HandleFunc("GET /api/public-access", server.handlePublicAccess)
 	mux.HandleFunc("PUT /api/public-access", server.handleSavePublicAccess)
 	mux.HandleFunc("POST /api/public-access/sync", server.handleSyncPublicAccess)
@@ -349,6 +364,7 @@ func (server *Server) handleCreateSession(writer http.ResponseWriter, request *h
 	server.sessions[session.ID] = &session
 	server.sessionToken[session.Token] = session.ID
 	server.activeID = session.ID
+	server.persistSessionsLocked()
 	writeJSON(writer, http.StatusCreated, publicOwnerSession(session))
 }
 
@@ -385,6 +401,7 @@ func (server *Server) handleStopSession(writer http.ResponseWriter, request *htt
 	if server.activeID == id {
 		server.activeID = ""
 	}
+	server.persistSessionsLocked()
 	peer := server.webrtcPeers[id]
 	delete(server.webrtcPeers, id)
 	response := publicOwnerSession(*session)
@@ -446,6 +463,7 @@ func (server *Server) handleJoinSession(writer http.ResponseWriter, request *htt
 			_ = wakeDevice(context.Background(), server.config.ADBPath, deviceID)
 		}()
 	}
+	server.persistSessionsLocked()
 	writeJSON(writer, http.StatusOK, publicGuestSession(*session, true))
 }
 
@@ -561,14 +579,20 @@ func (server *Server) sessionByTokenLocked(token string, now time.Time) (*Sessio
 }
 
 func (server *Server) refreshSessionsLocked(now time.Time) {
+	changed := false
 	for _, session := range server.sessions {
+		before := session.State
 		session.refresh(now)
+		changed = changed || before != session.State
 	}
 	if server.activeID != "" {
 		active := server.sessions[server.activeID]
 		if active == nil || active.State == "stopped" || active.State == "expired" {
 			server.activeID = ""
 		}
+	}
+	if changed {
+		server.persistSessionsLocked()
 	}
 }
 

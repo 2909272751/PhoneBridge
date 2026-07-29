@@ -118,7 +118,7 @@
             <span>内置 scrcpy</span><strong id="diag-scrcpy">检查中</strong><p id="diag-scrcpy-detail">正在验证随软件提供的手机流组件。</p>
           </article>
           <article class="diagnostic-card">
-            <span>WebRTC / TURN</span><strong class="warning">下一阶段</strong><p>接入后将验证P2P和强制中继回退。</p>
+            <span>WebRTC 视频</span><strong class="success">实时链路</strong><p>控制页可显示实际 UDP 转发、TURN 中继或局域网直连，以及 RTT、抖动、丢包和解码帧率。</p>
           </article>
         </div>
       </section>
@@ -132,6 +132,10 @@
           <article class="settings-card">
             <div><h2>默认分享时长</h2><p>新分享默认不限时，可在开始前按需限制。</p></div>
             <select disabled><option>30分钟</option></select>
+          </article>
+          <article class="settings-card">
+            <div><h2>软件更新</h2><p id="update-message">当前版本会在需要时手动检查 GitHub Release。</p></div>
+            <button class="button secondary" id="check-update" type="button">检查更新</button>
           </article>
           <article class="public-access-card">
             <div class="settings-heading">

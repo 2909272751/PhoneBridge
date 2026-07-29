@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
   <meta name="color-scheme" content="dark">
   <title>PhoneBridge 手机控制</title>
-  <link rel="stylesheet" href="/assets/app.css?v=remote-settings-1">
+  <link rel="stylesheet" href="/assets/app.css?v=experience-12">
 </head>
 <body class="controller-body">
   <div class="join-page" id="join-page">
@@ -37,12 +37,12 @@
 
   <div class="controller-shell hidden" id="controller-shell">
     <header class="controller-topbar">
-      <div class="controller-brand"><strong>PhoneBridge <small class="web-version">v1.0.0</small></strong><small class="mobile-transport" id="mobile-transport">传输 --</small><span id="controller-device-name">Android设备</span></div>
+      <div class="controller-brand"><strong>PhoneBridge <small class="web-version">v1.1.2</small></strong><small class="mobile-transport" id="mobile-transport">传输 --</small><span id="controller-device-name">Android设备</span></div>
       <div class="connection-chips">
         <span class="connection-chip" id="connection-chip"><i></i>建立连接</span>
         <span class="latency-chip" id="latency-chip">演示</span>
       </div>
-      <div class="controller-actions">
+        <div class="controller-actions">
         <span class="controller-countdown" id="controller-countdown">--:--</span>
         <select class="stream-profile" id="stream-profile" aria-label="视频分辨率与帧率">
           <option value="smooth">流畅：360p / 10fps</option>
@@ -68,6 +68,7 @@
           </label>
           <button type="button" id="apply-custom-profile">应用</button>
         </div>
+        <button class="control-top-button quick-smooth" id="quick-smooth" type="button" title="卡顿时一键切换到 360p / 10fps">流畅</button>
         <button class="control-top-button" id="fullscreen-button">全屏</button>
       </div>
     </header>
@@ -117,6 +118,16 @@
           <button data-control="rotate" title="旋转">↻</button>
         </div>
       </div>
+      <details class="network-diagnostics" id="network-diagnostics">
+        <summary>网络诊断 <span id="network-summary">正在测量…</span></summary>
+        <div class="network-diagnostic-grid">
+          <span>实际路径<strong id="diagnostic-path">正在协商</strong></span>
+          <span>往返延迟<strong id="diagnostic-rtt">--</strong></span>
+          <span>抖动 / 丢包<strong id="diagnostic-quality">--</strong></span>
+          <span>接收 / 解码<strong id="diagnostic-video">--</strong></span>
+        </div>
+        <p id="network-advice">保持页面打开，首帧到达后会显示真实链路指标。</p>
+      </details>
     </main>
 
     <footer class="controller-footer">
@@ -130,6 +141,6 @@
   </div>
 
   <div class="toast dark" id="toast" role="status" aria-live="polite"></div>
-  <script src="/assets/controller.js?v=telemetry-8" defer></script>
+  <script src="/assets/controller.js?v=experience-12" defer></script>
 </body>
 </html>

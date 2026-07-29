@@ -19,6 +19,9 @@ import (
 const (
 	frameChunkSize = 12 * 1024
 	frameInterval  = 900 * time.Millisecond
+	// Keep the established compatibility timeout. A browser without a usable
+	// STUN path must still have enough time to offer its normal UDP candidates.
+	fastICEGatherTimeout = 12 * time.Second
 )
 
 type webRTCPeer struct {
@@ -105,6 +108,7 @@ func (server *Server) handleStreamProfile(writer http.ResponseWriter, request *h
 	previousProfile, previousSize, previousFPS := session.StreamProfile, session.StreamMaxSize, session.StreamMaxFPS
 	session.StreamProfile = profile
 	session.StreamMaxSize, session.StreamMaxFPS = custom.maxSize, custom.maxFPS
+	server.persistSessionsLocked()
 	peer := server.webrtcPeers[session.ID]
 	response := publicGuestSession(*session, true)
 	server.mu.Unlock()
@@ -133,6 +137,7 @@ func (server *Server) handleWebRTCConfig(writer http.ResponseWriter, request *ht
 		"turnConfigured": hasTURNServer(server.config.ICEServers),
 		"transport":      "webrtc-datachannel",
 		"transportHint":  transportHint,
+		"directProbe":    len(server.config.ICEServers) > 0,
 	})
 }
 
@@ -305,7 +310,7 @@ func (server *Server) answerWebRTCOffer(ctx context.Context, sessionID string, i
 	case <-ctx.Done():
 		peer.close()
 		return nil, pion.SessionDescription{}, ctx.Err()
-	case <-time.After(12 * time.Second):
+	case <-time.After(fastICEGatherTimeout):
 		peer.close()
 		return nil, pion.SessionDescription{}, errors.New("ICE 候选收集超时")
 	}
@@ -607,7 +612,11 @@ func (server *Server) setWebRTCState(sessionID, state string) {
 	server.mu.Lock()
 	defer server.mu.Unlock()
 	if session := server.sessions[sessionID]; session != nil && session.State != "stopped" && session.State != "expired" {
+		if session.ConnectionMode == state {
+			return
+		}
 		session.ConnectionMode = state
+		server.persistSessionsLocked()
 	}
 }
 

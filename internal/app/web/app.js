@@ -45,6 +45,34 @@ async function refreshDevices() {
   }
 }
 
+async function checkForUpdate() {
+  const button = $("#check-update");
+  const message = $("#update-message");
+  if (button.dataset.releaseUrl) {
+    window.open(button.dataset.releaseUrl, "_blank", "noopener");
+    return;
+  }
+  button.disabled = true;
+  message.textContent = "正在安全检查 GitHub Release…";
+  try {
+    const update = await api("/api/update");
+    if (update.updateAvailable) {
+      message.textContent = `发现 v${update.latestVersion}，点击可打开下载页。`;
+      button.textContent = "打开下载页";
+      button.dataset.releaseUrl = update.releaseURL;
+      showToast(`发现新版本 v${update.latestVersion}`);
+    } else {
+      message.textContent = `当前已是最新版 v${update.currentVersion}。`;
+      button.textContent = "已是最新版";
+    }
+  } catch (error) {
+    message.textContent = error.message;
+    showToast(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function renderStatus(status) {
   $("#version-label").textContent = `版本 ${status.version}`;
   $("#top-version").textContent = `v${status.version}`;
@@ -372,6 +400,7 @@ document.addEventListener("DOMContentLoaded", () => {
   setupPublicAccess();
   $("#refresh-button").addEventListener("click", refreshDevices);
   $("#refresh-inline").addEventListener("click", refreshDevices);
+  $("#check-update").addEventListener("click", checkForUpdate);
   $("#share-form").addEventListener("submit", createShare);
   loadStatus();
 });
