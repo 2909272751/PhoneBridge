@@ -155,7 +155,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .success { color: var(--green); }
 .warning { color: var(--amber); }
 .danger { color: var(--red); }
-.settings-stack { display: grid; gap: 13px; }
+.settings-stack { display: grid; gap: 13px; padding-bottom: 8px; }
 .settings-card { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 20px 22px; border: 1px solid var(--line); border-radius: 15px; background: #fff; }
 .settings-card h2 { margin: 0; font-size: 14px; }
 .settings-card p { margin: 5px 0 0; color: var(--muted); font-size: 11px; }
@@ -167,6 +167,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .access-state { flex: 0 0 auto; padding: 6px 9px; border-radius: 99px; background: #eef3fb; color: #66748a; font-size: 10px; font-weight: 750; }
 .access-state.ready { background: #eaf9f2; color: #147b51; }
 .access-state.warning { background: #fff7e4; color: #936513; }
+.access-state.danger { background: #fdecec; color: var(--red); }
 .access-mode { display: flex; gap: 9px; margin-top: 20px; }
 .access-mode input { position: absolute; opacity: 0; pointer-events: none; }
 .access-mode span { display: block; padding: 9px 12px; border: 1px solid var(--line); border-radius: 9px; color: #687289; font-size: 11px; font-weight: 700; cursor: pointer; }
@@ -174,10 +175,25 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .public-access-fields { display: grid; gap: 13px; margin-top: 16px; padding: 16px; border-radius: 12px; background: #f8faff; }
 .public-access-fields label { display: grid; gap: 7px; color: #536076; font-size: 11px; font-weight: 750; }
 .public-access-fields input, .public-access-fields select { width: 100%; min-width: 0; box-sizing: border-box; padding: 10px 11px; border: 1px solid #d8e0ed; border-radius: 9px; background: #fff; color: #25324b; font: inherit; }
+.frp-login-card { padding: 14px; border: 1px solid #dbe4f2; border-radius: 12px; background: #f2f6ff; }
+.frp-login-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.frp-login-heading strong { font-size: 12px; color: #33405c; }
+.frp-login-state { flex: 0 0 auto; padding: 5px 9px; border-radius: 99px; background: #eef3fb; color: #66748a; font-size: 10px; font-weight: 750; }
+.frp-login-state.ready { background: #eaf9f2; color: #147b51; }
+.frp-login-state.warning { background: #fff7e4; color: #936513; }
+.frp-login-state.danger { background: #fdecec; color: var(--red); }
+.frp-login-fields { display: grid; gap: 12px; }
+.frp-login-card .access-actions { margin-top: 12px; }
+.frp-login-form { display: grid; gap: 12px; }
+.frp-login-form > label { display: grid; gap: 7px; color: #536076; font-size: 11px; font-weight: 750; }
+.frp-login-form > label input { width: 100%; box-sizing: border-box; padding: 10px 11px; border: 1px solid #d8e0ed; border-radius: 9px; background: #fff; color: #25324b; font: inherit; }
 .two-fields { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 13px; }
 .scheme-picker { max-width: 190px; }
 .checkbox-line { display: flex !important; grid-template-columns: auto 1fr; align-items: center; gap: 8px !important; font-weight: 600 !important; }
 .checkbox-line input { width: 16px; height: 16px; accent-color: var(--blue); }
+.checkbox-line input:disabled { cursor: not-allowed; opacity: .5; }
+.frp-remember-line { margin-top: 2px; }
+.remember-hint { color: var(--muted); font-size: 10px; font-weight: 400; line-height: 1.5; }
 .field-hint, .access-message { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.6; }
 .field-hint code { padding: 2px 4px; border-radius: 4px; background: #eaf0fa; color: #54627a; }
 .access-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 16px; }

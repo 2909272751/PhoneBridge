@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,13 +29,18 @@ const (
 // PublicAccessSettings contains only local sharing settings. 88FRP credentials
 // deliberately remain owned by the already signed-in 88FRP desktop client.
 type PublicAccessSettings struct {
-	Source        string `json:"source"`
-	ManualURL     string `json:"manualUrl"`
-	FRPServiceURL string `json:"frpServiceUrl"`
-	FRPInstanceID string `json:"frpInstanceId"`
-	FRPTunnelName string `json:"frpTunnelName"`
-	FRPScheme     string `json:"frpScheme"`
-	AutoSync      bool   `json:"autoSync"`
+	Source            string `json:"source"`
+	ManualURL         string `json:"manualUrl"`
+	FRPServiceURL     string `json:"frpServiceUrl"`
+	FRPInstanceID     string `json:"frpInstanceId"`
+	FRPTunnelName     string `json:"frpTunnelName"`
+	FRPScheme         string `json:"frpScheme"`
+	AutoSync          bool   `json:"autoSync"`
+	FRPLastSuccessURL string `json:"frpLastSuccessUrl,omitempty"`
+	// FRPUDPForward is the last successfully discovered 88FRP UDP mapping for
+	// the local WebRTC ICE port. It stores only public endpoint metadata;
+	// 88FRP credentials and cookies are never persisted here.
+	FRPUDPForward *UDPForwardMapping `json:"frpUdpForward,omitempty"`
 }
 
 type PublicAccessSnapshot struct {
@@ -60,8 +67,29 @@ type FRPTunnel struct {
 	Enabled     bool   `json:"enabled"`
 }
 
+// UDPForwardMapping is the last successfully discovered 88FRP UDP proxy
+// mapping for the local WebRTC ICE port.
+type UDPForwardMapping struct {
+	PublicHost   string    `json:"publicHost"`
+	PublicPort   int       `json:"publicPort"`
+	LocalICEPort int       `json:"localIcePort"`
+	TunnelName   string    `json:"tunnelName,omitempty"`
+	DiscoveredAt time.Time `json:"discoveredAt"`
+}
+
+// validFor reports whether the mapping is structurally valid and targets the
+// given local ICE port. A mapping is never invented: it is only returned when
+// it was previously discovered and persisted by a successful 88FRP sync.
+func (mapping *UDPForwardMapping) validFor(localPort int) bool {
+	return mapping != nil &&
+		strings.TrimSpace(mapping.PublicHost) != "" &&
+		mapping.PublicPort >= 1 && mapping.PublicPort <= 65535 &&
+		mapping.LocalICEPort == localPort
+}
+
 type publicAccessFile struct {
 	Settings PublicAccessSettings `json:"publicAccess"`
+	ProbeID  string               `json:"probeId,omitempty"`
 }
 
 type PublicAccessManager struct {
@@ -71,6 +99,19 @@ type PublicAccessManager struct {
 	logger    *log.Logger
 	client    *http.Client
 	snapshot  PublicAccessSnapshot
+	probeID   string
+	// udpLocalPort is the local WebRTC ICE port that the 88FRP UDP proxy
+	// targets (default 3478). It is set by the server from config.ICEPort.
+	udpLocalPort int
+	// udpForwardListener is invoked after a fresh 88FRP UDP mapping is
+	// persisted, so the server can advertise it without a restart.
+	udpForwardListener func()
+	// frpClient is the authenticated 88FRP HTTP client (in-memory cookie jar)
+	// injected after a successful local login. When nil, the default anonymous
+	// client is used, which matches the "already signed-in 88FRP desktop
+	// client" behavior. It is never persisted.
+	frpClientMu sync.RWMutex
+	frpClient   *http.Client
 }
 
 func NewPublicAccessManager(settingsPath, initialURL string, localPort int, logger *log.Logger) *PublicAccessManager {
@@ -78,11 +119,12 @@ func NewPublicAccessManager(settingsPath, initialURL string, localPort int, logg
 		logger = log.Default()
 	}
 	manager := &PublicAccessManager{
-		path:      settingsPath,
-		localPort: localPort,
-		logger:    logger,
-		client:    &http.Client{Timeout: 6 * time.Second},
-		snapshot:  PublicAccessSnapshot{Settings: defaultPublicAccessSettings(), State: "local", Message: "使用本机地址；配置公网地址后新分享链接会自动更新。"},
+		path:         settingsPath,
+		localPort:    localPort,
+		logger:       logger,
+		client:       &http.Client{Timeout: 6 * time.Second},
+		udpLocalPort: 3478,
+		snapshot:     PublicAccessSnapshot{Settings: defaultPublicAccessSettings(), State: "local", Message: "使用本机地址；配置公网地址后新分享链接会自动更新。"},
 	}
 	if err := manager.load(initialURL); err != nil {
 		logger.Printf("读取公网分享设置失败：%v", err)
@@ -128,9 +170,13 @@ func (manager *PublicAccessManager) load(initialURL string) error {
 				return fmt.Errorf("设置文件格式无效：%w", err)
 			}
 			settings = normalizePublicAccessSettings(saved.Settings)
+			manager.probeID = strings.TrimSpace(saved.ProbeID)
 		} else if !os.IsNotExist(err) {
 			return err
 		}
+	}
+	if manager.probeID == "" {
+		manager.probeID = generateProbeID()
 	}
 	if strings.TrimSpace(initialURL) != "" {
 		settings.Source = publicAccessManual
@@ -143,8 +189,14 @@ func (manager *PublicAccessManager) load(initialURL string) error {
 			manager.snapshot.State = "manual-ready"
 			manager.snapshot.Message = "已使用手动公网地址；新创建的分享链接会使用该地址。"
 		}
+	} else if settings.Source == publicAccess88FRP && settings.FRPLastSuccessURL != "" {
+		if value, err := normalizePublicURL(settings.FRPLastSuccessURL); err == nil {
+			manager.snapshot.EffectiveURL = value
+		}
 	}
-	return nil
+	// Persist once so the local probe ID (and any restored last-success URL)
+	// is durable even before the user saves anything.
+	return manager.persist(settings)
 }
 
 func normalizePublicAccessSettings(input PublicAccessSettings) PublicAccessSettings {
@@ -164,6 +216,7 @@ func normalizePublicAccessSettings(input PublicAccessSettings) PublicAccessSetti
 	if input.FRPScheme != "https" {
 		input.FRPScheme = "http"
 	}
+	input.FRPLastSuccessURL = strings.TrimSpace(input.FRPLastSuccessURL)
 	return input
 }
 
@@ -212,45 +265,187 @@ func (manager *PublicAccessManager) EffectiveURL() string {
 	return manager.snapshot.EffectiveURL
 }
 
+// SetUDPForwardListener registers a callback invoked when a fresh 88FRP UDP
+// mapping is discovered and persisted, so WebRTC can be advertised without
+// restarting PhoneBridge.
+func (manager *PublicAccessManager) SetUDPForwardListener(listener func()) {
+	manager.mu.Lock()
+	manager.udpForwardListener = listener
+	manager.mu.Unlock()
+}
+
+// SettingsPath returns the settings file path backing this manager. It is
+// used to derive the location of the dedicated encrypted credentials file.
+func (manager *PublicAccessManager) SettingsPath() string {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	return manager.path
+}
+
+// SetFRPClient replaces the HTTP client used for authenticated 88FRP API
+// calls. The client carries an in-memory cookie jar and is never persisted.
+// A nil value restores the default anonymous client.
+func (manager *PublicAccessManager) SetFRPClient(client *http.Client) {
+	manager.frpClientMu.Lock()
+	manager.frpClient = client
+	manager.frpClientMu.Unlock()
+}
+
+func (manager *PublicAccessManager) frpHTTPClient() *http.Client {
+	manager.frpClientMu.RLock()
+	client := manager.frpClient
+	manager.frpClientMu.RUnlock()
+	if client == nil {
+		return manager.client
+	}
+	return client
+}
+
+// SetUDPForwardLocalPort records the local WebRTC ICE port that 88FRP UDP
+// proxies target. A zero value keeps the default 3478.
+func (manager *PublicAccessManager) SetUDPForwardLocalPort(port int) {
+	if port == 0 {
+		port = 3478
+	}
+	manager.mu.Lock()
+	manager.udpLocalPort = port
+	manager.mu.Unlock()
+}
+
+func (manager *PublicAccessManager) udpLocalPortValue() int {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	if manager.udpLocalPort == 0 {
+		return 3478
+	}
+	return manager.udpLocalPort
+}
+
 // DiscoverUDPForward returns the public endpoint of the enabled 88FRP UDP
-// proxy targeting the local ICE port. It reads only the already authenticated
-// local 88FRP companion; no account secret is copied into PhoneBridge.
-func (manager *PublicAccessManager) DiscoverUDPForward(ctx context.Context, localPort int) (string, int, error) {
+// proxy targeting the local ICE port. It prefers a fresh result from the
+// already authenticated local 88FRP companion. When the management API is
+// unavailable (HTTP 401, timeout, malformed response) it may return the
+// structurally valid persisted mapping marked stale (fresh=false), so WebRTC
+// keeps working through recovery after a restart. It never invents a mapping.
+func (manager *PublicAccessManager) DiscoverUDPForward(ctx context.Context, localPort int) (string, int, bool, error) {
 	manager.mu.RLock()
 	settings := manager.snapshot.Settings
 	manager.mu.RUnlock()
 	if settings.Source != publicAccess88FRP {
-		return "", 0, errors.New("88FRP public sharing is not enabled")
+		return "", 0, false, errors.New("88FRP public sharing is not enabled")
 	}
 	serviceURL, err := validateLocalFRPService(settings.FRPServiceURL)
 	if err != nil {
-		return "", 0, err
+		return manager.restoreUDPForward(localPort, err)
 	}
 	if settings.FRPInstanceID == "" {
-		return "", 0, errors.New("88FRP instance is not selected")
+		return manager.restoreUDPForward(localPort, errors.New("88FRP instance is not selected"))
 	}
 	tunnels, configText, err := manager.fetchInstance(ctx, serviceURL, settings.FRPInstanceID)
 	if err != nil {
-		return "", 0, err
+		return manager.restoreUDPForward(localPort, err)
 	}
 	for _, tunnel := range tunnels {
 		if tunnel.Enabled && strings.EqualFold(strings.TrimSpace(tunnel.Type), "udp") && portFromValue(tunnel.LocalPort) == localPort {
 			host, hostErr := frpServerHost(configText)
 			if hostErr != nil {
-				return "", 0, hostErr
+				return manager.restoreUDPForward(localPort, hostErr)
 			}
 			port := portFromValue(tunnel.RemotePort)
 			if port < 1 || port > 65535 {
-				return "", 0, errors.New("88FRP UDP proxy has no valid public port")
+				return manager.restoreUDPForward(localPort, errors.New("88FRP UDP proxy has no valid public port"))
 			}
-			return host, port, nil
+			mapping := &UDPForwardMapping{
+				PublicHost:   host,
+				PublicPort:   port,
+				LocalICEPort: localPort,
+				TunnelName:   strings.TrimSpace(tunnel.Name),
+				DiscoveredAt: time.Now(),
+			}
+			manager.saveUDPForward(mapping)
+			return host, port, true, nil
 		}
 	}
-	return "", 0, fmt.Errorf("no enabled 88FRP UDP proxy targets local port %d", localPort)
+	return manager.restoreUDPForward(localPort, fmt.Errorf("no enabled 88FRP UDP proxy targets local port %d", localPort))
+}
+
+// refreshUDPForward best-effort re-runs UDP discovery after an authenticated
+// 88FRP sync so a fresh mapping is persisted and the server is notified.
+func (manager *PublicAccessManager) refreshUDPForward(ctx context.Context) error {
+	_, _, _, err := manager.DiscoverUDPForward(ctx, manager.udpLocalPortValue())
+	return err
+}
+
+// restoreUDPForward falls back to the persisted UDP mapping when a fresh
+// discovery failed. The mapping is returned marked stale; it is only used when
+// structurally valid for the requested local ICE port.
+func (manager *PublicAccessManager) restoreUDPForward(localPort int, discoveryErr error) (string, int, bool, error) {
+	mapping := manager.udpForwardMapping()
+	if !mapping.validFor(localPort) {
+		return "", 0, false, discoveryErr
+	}
+	manager.logger.Printf("88FRP UDP 发现失败（%v），使用已持久化的恢复映射 %s:%d", discoveryErr, mapping.PublicHost, mapping.PublicPort)
+	return mapping.PublicHost, mapping.PublicPort, false, nil
+}
+
+func (manager *PublicAccessManager) udpForwardMapping() *UDPForwardMapping {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	return manager.snapshot.Settings.FRPUDPForward
+}
+
+// saveUDPForward persists a freshly discovered mapping and notifies the server
+// listener when the mapping actually changed.
+func (manager *PublicAccessManager) saveUDPForward(mapping *UDPForwardMapping) {
+	manager.mu.Lock()
+	settings := manager.snapshot.Settings
+	changed := !sameUDPForward(settings.FRPUDPForward, mapping)
+	if changed {
+		settings.FRPUDPForward = mapping
+		manager.snapshot.Settings = settings
+	}
+	listener := manager.udpForwardListener
+	manager.mu.Unlock()
+	if !changed {
+		return
+	}
+	if err := manager.persist(settings); err != nil {
+		manager.logger.Printf("持久化 88FRP UDP 映射失败：%v", err)
+	}
+	if listener != nil {
+		// Discovery may run while Server.ensurePublicICE holds its ICE lock.
+		// Notify asynchronously so persisting a fresh mapping cannot deadlock
+		// by synchronously re-entering ensurePublicICE through the listener.
+		go listener()
+	}
+}
+
+func sameUDPForward(left, right *UDPForwardMapping) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.PublicHost == right.PublicHost &&
+		left.PublicPort == right.PublicPort &&
+		left.LocalICEPort == right.LocalICEPort &&
+		left.TunnelName == right.TunnelName
 }
 
 func (manager *PublicAccessManager) Save(ctx context.Context, input PublicAccessSettings) (PublicAccessSnapshot, error) {
 	settings := normalizePublicAccessSettings(input)
+	// FRPLastSuccessURL is internal recovery state and is intentionally not
+	// submitted by the web form. Preserve it while saving the user's visible
+	// settings so a management-API failure can still verify the last tunnel.
+	manager.mu.RLock()
+	currentSettings := manager.snapshot.Settings
+	manager.mu.RUnlock()
+	if settings.Source == publicAccess88FRP && settings.FRPLastSuccessURL == "" {
+		settings.FRPLastSuccessURL = currentSettings.FRPLastSuccessURL
+	}
+	// Like FRPLastSuccessURL, the UDP mapping is internal recovery state and is
+	// not submitted by the settings form. Never erase it on an ordinary save.
+	if settings.Source == publicAccess88FRP && settings.FRPUDPForward == nil {
+		settings.FRPUDPForward = currentSettings.FRPUDPForward
+	}
 	if settings.Source == publicAccessManual {
 		if settings.ManualURL == "" {
 			manager.mu.Lock()
@@ -291,7 +486,7 @@ func (manager *PublicAccessManager) persist(settings PublicAccessSettings) error
 	if manager.path == "" {
 		return nil
 	}
-	data, err := json.MarshalIndent(publicAccessFile{Settings: settings}, "", "  ")
+	data, err := json.MarshalIndent(publicAccessFile{Settings: settings, ProbeID: manager.probeID}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -342,7 +537,7 @@ func (manager *PublicAccessManager) Sync(ctx context.Context) (PublicAccessSnaps
 	}
 	instances, err := manager.fetchInstances(ctx, serviceURL)
 	if err != nil {
-		manager.setSyncError(settings, nil, nil, err)
+		manager.syncFailed(settings, nil, nil, err)
 		return manager.Snapshot(), err
 	}
 	if settings.FRPInstanceID == "" {
@@ -351,7 +546,7 @@ func (manager *PublicAccessManager) Sync(ctx context.Context) (PublicAccessSnaps
 	}
 	tunnels, configText, err := manager.fetchInstance(ctx, serviceURL, settings.FRPInstanceID)
 	if err != nil {
-		manager.setSyncError(settings, instances, nil, err)
+		manager.syncFailed(settings, instances, nil, err)
 		return manager.Snapshot(), err
 	}
 	if settings.FRPTunnelName == "" {
@@ -398,6 +593,20 @@ func (manager *PublicAccessManager) Sync(ctx context.Context) (PublicAccessSnaps
 		return manager.Snapshot(), err
 	}
 	publicURL := (&url.URL{Scheme: settings.FRPScheme, Host: net.JoinHostPort(host, strconv.Itoa(remotePort))}).String()
+	settings.FRPLastSuccessURL = publicURL
+	if err := manager.persist(settings); err != nil {
+		manager.logger.Printf("持久化 88FRP 公网地址失败：%v", err)
+	}
+	// A successful authenticated sync also refreshes the UDP forward mapping so
+	// WebRTC can be advertised without restarting PhoneBridge.
+	if err := manager.refreshUDPForward(ctx); err != nil {
+		manager.logger.Printf("刷新 88FRP UDP 映射失败：%v", err)
+	}
+	// The UDP refresh above may have persisted a new mapping; read the settings
+	// back so the snapshot below includes it.
+	manager.mu.RLock()
+	settings = manager.snapshot.Settings
+	manager.mu.RUnlock()
 	now := time.Now()
 	manager.setSnapshot(PublicAccessSnapshot{Settings: settings, EffectiveURL: publicURL, State: "frp-ready", Message: fmt.Sprintf("已从 88FRP 同步：%s", publicURL), LastSyncedAt: &now, Instances: instances, Tunnels: tunnels})
 	return manager.Snapshot(), nil
@@ -414,10 +623,86 @@ func (manager *PublicAccessManager) setSyncError(settings PublicAccessSettings, 
 	manager.setSnapshot(PublicAccessSnapshot{Settings: settings, EffectiveURL: current.EffectiveURL, State: "frp-error", Message: "88FRP 同步失败：" + err.Error(), LastSyncedAt: current.LastSyncedAt, Instances: instances, Tunnels: tunnels})
 }
 
+func (manager *PublicAccessManager) ProbeID() string {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	return manager.probeID
+}
+
+// syncFailed handles a 88FRP management-API failure (HTTP 401, timeout, or a
+// malformed response). When a last successful public URL exists, it probes that
+// URL's dedicated health endpoint before deciding whether the tunnel is still
+// reachable by the current PhoneBridge instance.
+func (manager *PublicAccessManager) syncFailed(settings PublicAccessSettings, instances []FRPInstance, tunnels []FRPTunnel, err error) {
+	current := manager.Snapshot()
+	oldURL := strings.TrimSpace(settings.FRPLastSuccessURL)
+	if oldURL == "" {
+		oldURL = strings.TrimSpace(current.EffectiveURL)
+	}
+	if oldURL == "" {
+		manager.setSnapshot(PublicAccessSnapshot{Settings: settings, State: "frp-error", Message: "88FRP 同步失败：" + err.Error(), LastSyncedAt: current.LastSyncedAt, Instances: instances, Tunnels: tunnels})
+		return
+	}
+	if manager.verifyPublicHealth(context.Background(), oldURL) {
+		manager.setSnapshot(PublicAccessSnapshot{Settings: settings, EffectiveURL: oldURL, State: "frp-stale-ready", Message: fmt.Sprintf("公网可用，但 88FRP 自动同步需重新登录/暂时失败：%v。仍继续使用 %s。", err, oldURL), LastSyncedAt: current.LastSyncedAt, Instances: instances, Tunnels: tunnels})
+		return
+	}
+	manager.setSnapshot(PublicAccessSnapshot{Settings: settings, EffectiveURL: oldURL, State: "frp-unreachable", Message: fmt.Sprintf("无法确认公网地址 %s 仍指向本机：%v。该地址保留供诊断，但当前不能宣称公网可用。", oldURL, err), LastSyncedAt: current.LastSyncedAt, Instances: instances, Tunnels: tunnels})
+}
+
+// verifyPublicHealth asks the public URL's lightweight health endpoint and
+// compares the returned local probe ID, never trusting a bare HTTP 200.
+func (manager *PublicAccessManager) verifyPublicHealth(ctx context.Context, publicURL string) bool {
+	base, err := normalizePublicURL(publicURL)
+	if err != nil {
+		return false
+	}
+	probe := manager.ProbeID()
+	if probe == "" {
+		return false
+	}
+	requestContext, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestContext, http.MethodGet, base+"/healthz", nil)
+	if err != nil {
+		return false
+	}
+	response, err := manager.client.Do(request)
+	if err != nil {
+		return false
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return false
+	}
+	var payload healthPayload
+	decoder := json.NewDecoder(io.LimitReader(response.Body, 4<<10))
+	if err := decoder.Decode(&payload); err != nil {
+		return false
+	}
+	return payload.App == "PhoneBridge" && payload.ProbeID == probe
+}
+
+func generateProbeID() string {
+	var buffer [16]byte
+	if _, err := rand.Read(buffer[:]); err != nil {
+		return "unknown-probe"
+	}
+	return hex.EncodeToString(buffer[:])
+}
+
 type frpEnvelope struct {
 	Success bool            `json:"success"`
 	Message string          `json:"message"`
 	Data    json.RawMessage `json:"data"`
+}
+
+// healthPayload is the response body of the lightweight GET /healthz
+// endpoint used by outbound public-URL verification.
+type healthPayload struct {
+	App     string `json:"app"`
+	Version string `json:"version"`
+	ProbeID string `json:"probeId"`
 }
 
 func (manager *PublicAccessManager) fetchInstances(ctx context.Context, serviceURL string) ([]FRPInstance, error) {
@@ -450,7 +735,7 @@ func (manager *PublicAccessManager) getJSON(ctx context.Context, address string,
 	if err != nil {
 		return err
 	}
-	response, err := manager.client.Do(request)
+	response, err := manager.frpHTTPClient().Do(request)
 	if err != nil {
 		return err
 	}

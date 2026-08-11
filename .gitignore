@@ -2,4 +2,5 @@
 /dist/
 /.cache/
 /.phonebridge/
+/.codex-helper/
 *.log

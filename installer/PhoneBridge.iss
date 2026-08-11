@@ -1,5 +1,5 @@
 #define AppName "PhoneBridge"
-#define AppVersion "2.0"
+#define AppVersion "2.1.1"
 #define AppPublisher "PhoneBridge"
 
 [Setup]
@@ -43,9 +43,6 @@ Name: "{autostartup}\PhoneBridge"; Filename: "{app}\PhoneBridge.exe"; WorkingDir
 Name: "autostart"; Description: "登录 Windows 时在后台启动 PhoneBridge"; GroupDescription: "启动选项："; Flags: checkedonce
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加图标："; Flags: unchecked
 
-[Run]
-Filename: "{app}\PhoneBridge.exe"; Parameters: "--open-browser"; WorkingDir: "{app}"; Description: "立即启动 PhoneBridge"; Flags: nowait postinstall skipifsilent runhidden
-
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM PhoneBridge.exe"; Flags: runhidden; RunOnceId: "StopPhoneBridge"
 
@@ -68,4 +65,27 @@ begin
       SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Sleep(400);
   Result := '';
+end;
+
+{ Launch the freshly installed host after every successful install, whether it
+  was a visible install, a silent (/SILENT or /VERYSILENT) install, or a silent
+  upgrade. This replaced the old [Run] entry whose silent-skip flag silently
+  disabled the launch during unattended installs. A single launch here (never
+  paired with a [Run] entry) guarantees at most one PhoneBridge instance, and
+  it runs only after files were copied, the old process was stopped and the
+  ADB kill-server finished — PrepareToInstall and ssPostInstall ordering. }
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+  Params: String;
+begin
+  if CurStep = ssPostInstall then
+  begin
+    if WizardSilent then
+      Params := ''
+    else
+      Params := '--open-browser';
+    Exec(ExpandConstant('{app}\PhoneBridge.exe'), Params,
+      ExpandConstant('{app}'), SW_HIDE, ewNoWait, ResultCode);
+  end;
 end;

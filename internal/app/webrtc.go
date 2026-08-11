@@ -137,17 +137,40 @@ func (server *Server) handleWebRTCConfig(writer http.ResponseWriter, request *ht
 		writeError(writer, http.StatusConflict, "控制已被新的连接接管")
 		return
 	}
+	server.iceMu.Lock()
+	udpForwardActive := server.icePublicPort != 0
+	udpForwardFresh := server.iceUDPFresh
+	server.iceMu.Unlock()
 	transportHint := "direct"
-	if server.icePublicPort != 0 {
+	if udpForwardActive {
 		transportHint = "frp-udp"
 	}
 	writeJSON(writer, http.StatusOK, map[string]any{
-		"iceServers":     server.config.ICEServers,
-		"turnConfigured": hasTURNServer(server.config.ICEServers),
-		"transport":      "webrtc-datachannel",
-		"transportHint":  transportHint,
-		"directProbe":    len(server.config.ICEServers) > 0,
+		"iceServers":       server.config.ICEServers,
+		"turnConfigured":   hasTURNServer(server.config.ICEServers),
+		"transport":        "webrtc-datachannel",
+		"transportHint":    transportHint,
+		"directProbe":      len(server.config.ICEServers) > 0,
+		"udpForwardActive": udpForwardActive,
+		"udpForwardFresh":  udpForwardFresh,
+		"realtimeExpected": udpForwardActive || hasTURNServer(server.config.ICEServers),
+		"reason":           webrtcTransportReason(udpForwardActive, udpForwardFresh, server.config.ICEServers),
 	})
+}
+
+// webrtcTransportReason returns a user-readable explanation of whether
+// realtime WebRTC media is expected, without exposing any secret.
+func webrtcTransportReason(udpForwardActive, udpForwardFresh bool, servers []ICEServerConfig) string {
+	switch {
+	case udpForwardActive && udpForwardFresh:
+		return "已通过 88FRP 公网 UDP 映射启用低延迟视频"
+	case udpForwardActive:
+		return "使用上次成功保存的 88FRP UDP 映射（已恢复），低延迟视频可用"
+	case hasTURNServer(servers):
+		return "未发现公网 UDP 映射，但已配置 TURN 中继"
+	default:
+		return "当前没有公网 UDP 映射且未配置 TURN，低延迟视频可能无法建立，将使用兼容画面"
+	}
 }
 
 func hasTURNServer(servers []ICEServerConfig) bool {
@@ -204,15 +227,30 @@ func (server *Server) handleWebRTCOffer(writer http.ResponseWriter, request *htt
 
 	server.mu.Lock()
 	current := server.sessions[sessionID]
-	if current == nil || current.State == "stopped" || current.State == "expired" || current.ViewerState != "connected" || current.ViewerToken != viewerToken {
+	status, message := offerConflictStatus(current, viewerToken)
+	if status != 0 {
 		server.mu.Unlock()
 		peer.close()
-		writeError(writer, http.StatusGone, "会话已结束")
+		writeError(writer, status, message)
 		return
 	}
 	server.webrtcPeers[sessionID] = peer
 	server.mu.Unlock()
 	writeJSON(writer, http.StatusOK, answer)
+}
+
+// offerConflictStatus reports why a WebRTC offer from viewerToken must be
+// rejected after answering. A zero status means the offer may be registered.
+// A viewer whose lease was taken over while the offer was being answered must
+// receive 409 so its browser stops retrying instead of looping forever.
+func offerConflictStatus(session *Session, viewerToken string) (status int, message string) {
+	if session == nil || session.State == "stopped" || session.State == "expired" || session.ViewerState != "connected" {
+		return http.StatusGone, "会话已结束"
+	}
+	if session.ViewerToken != viewerToken {
+		return http.StatusConflict, "控制已被新的连接接管"
+	}
+	return 0, ""
 }
 
 func (server *Server) answerWebRTCOffer(ctx context.Context, sessionID string, input webRTCOfferRequest) (*webRTCPeer, pion.SessionDescription, error) {
@@ -227,7 +265,10 @@ func (server *Server) answerWebRTCOffer(ctx context.Context, sessionID string, i
 			Credential: serverConfig.Credential,
 		})
 	}
+	server.iceMu.Lock()
 	api := server.webRTCAPI
+	publicPort := server.icePublicPort
+	server.iceMu.Unlock()
 	if api == nil {
 		api = pion.NewAPI()
 	}
@@ -260,12 +301,12 @@ func (server *Server) answerWebRTCOffer(ctx context.Context, sessionID string, i
 	pc.OnConnectionStateChange(func(state pion.PeerConnectionState) {
 		switch state {
 		case pion.PeerConnectionStateConnected:
-			server.setWebRTCState(sessionID, "webrtc")
+			peer.setSessionState("webrtc")
 			peer.startVideoPump()
 		case pion.PeerConnectionStateDisconnected:
-			server.setWebRTCState(sessionID, "reconnecting")
+			peer.setSessionState("reconnecting")
 		case pion.PeerConnectionStateFailed, pion.PeerConnectionStateClosed:
-			server.setWebRTCState(sessionID, "fallback-screen")
+			peer.setSessionState("fallback-screen")
 		}
 	})
 	pc.OnDataChannel(func(channel *pion.DataChannel) {
@@ -299,7 +340,7 @@ func (server *Server) answerWebRTCOffer(ctx context.Context, sessionID string, i
 			peer.statsMu.Lock()
 			peer.stats.DataChannelOpen = true
 			peer.statsMu.Unlock()
-			server.setWebRTCState(sessionID, "webrtc")
+			peer.setSessionState("webrtc")
 			peer.startVideoPump()
 		})
 		channel.OnError(peer.recordError)
@@ -334,8 +375,8 @@ func (server *Server) answerWebRTCOffer(ctx context.Context, sessionID string, i
 		return nil, pion.SessionDescription{}, errors.New("未生成 WebRTC answer")
 	}
 	local := *pc.LocalDescription()
-	if server.icePublicPort != 0 {
-		local.SDP = rewriteICECandidatePort(local.SDP, server.config.ICEPort, server.icePublicPort)
+	if publicPort != 0 {
+		local.SDP = rewriteICECandidatePort(local.SDP, server.config.ICEPort, publicPort)
 	}
 	return peer, local, nil
 }
@@ -422,7 +463,7 @@ func (peer *webRTCPeer) startVideoPump() {
 					stopStream()
 					peer.recordError(fmt.Errorf("启动 scrcpy 视频流失败：%w", err))
 					peer.setVideoState("failed")
-					peer.server.setWebRTCState(peer.sessionID, "fallback-screen")
+					peer.setSessionState("fallback-screen")
 					return
 				}
 				peer.setStream(stream)
@@ -469,7 +510,7 @@ func (peer *webRTCPeer) startVideoPump() {
 				if err != nil && !errors.Is(err, io.EOF) && parent.Err() == nil {
 					peer.recordError(fmt.Errorf("scrcpy 视频流中断：%w", err))
 					peer.setVideoState("failed")
-					peer.server.setWebRTCState(peer.sessionID, "fallback-screen")
+					peer.setSessionState("fallback-screen")
 				}
 				return
 			}
@@ -627,6 +668,27 @@ func (server *Server) setWebRTCState(sessionID, state string) {
 	server.mu.Lock()
 	defer server.mu.Unlock()
 	if session := server.sessions[sessionID]; session != nil && session.State != "stopped" && session.State != "expired" {
+		if session.ConnectionMode == state {
+			return
+		}
+		session.ConnectionMode = state
+		server.persistSessionsLocked()
+	}
+}
+
+// setSessionState writes the session's connection state only while this peer
+// is still the session's registered peer. Late asynchronous callbacks from a
+// replaced peer — connection-state changes, scrcpy stream failures, data
+// channel close — must never overwrite the newer peer's session state with
+// fallback-screen/reconnecting.
+func (peer *webRTCPeer) setSessionState(state string) {
+	server := peer.server
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if server.webrtcPeers[peer.sessionID] != peer {
+		return
+	}
+	if session := server.sessions[peer.sessionID]; session != nil && session.State != "stopped" && session.State != "expired" {
 		if session.ConnectionMode == state {
 			return
 		}

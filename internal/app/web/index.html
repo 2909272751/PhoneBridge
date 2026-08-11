@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light">
   <title>PhoneBridge</title>
   <link rel="icon" type="image/png" href="/assets/phonebridge-logo.png">
-  <link rel="stylesheet" href="/assets/app.css?v=experience-14">
+  <link rel="stylesheet" href="/assets/app.css?v=experience-15">
 </head>
 <body class="host-body">
   <div class="host-shell">
@@ -122,7 +122,7 @@
             <span>内置 scrcpy</span><strong id="diag-scrcpy">检查中</strong><p id="diag-scrcpy-detail">正在验证随软件提供的手机流组件。</p>
           </article>
           <article class="diagnostic-card">
-            <span>WebRTC 视频</span><strong class="success">实时链路</strong><p>控制页可显示实际 UDP 转发、TURN 中继或局域网直连，以及 RTT、抖动、丢包和解码帧率。</p>
+            <span>WebRTC 视频</span><strong id="diag-webrtc">检查中</strong><p id="diag-webrtc-detail">正在读取实时传输状态。</p>
           </article>
         </div>
       </section>
@@ -156,13 +156,39 @@
             </div>
             <div class="public-access-fields hidden" id="frp-public-fields">
               <label>88FRP 本机服务<input id="frp-service-url" type="url" value="http://127.0.0.1:8801"></label>
+              <div class="frp-login-card" id="frp-login-card">
+                <div class="frp-login-heading">
+                  <strong>88FRP 安全登录</strong>
+                  <span class="frp-login-state" id="frp-login-state">未登录</span>
+                </div>
+                <div class="frp-login-fields" id="frp-login-fields">
+                  <div class="frp-login-form" id="frp-login-form">
+                    <div class="two-fields">
+                      <label>88FRP 用户名<input id="frp-username" type="text" autocomplete="username"></label>
+                      <label>88FRP 密码<input id="frp-password" type="password" autocomplete="current-password"></label>
+                    </div>
+                    <label class="checkbox-line frp-remember-line"><input id="frp-remember" type="checkbox" checked>记住登录<span class="remember-hint" id="frp-remember-hint"></span></label>
+                    <p class="field-hint">密码只在当前浏览器用 WebCrypto 生成一次性证明（PBKDF2 派生密钥 + HMAC 签名），生成后立即清空。本机勾选“记住登录”时，凭据经系统加密保存，重启后自动恢复登录；公网页面不会发送或保存密码。</p>
+                    <div class="access-actions">
+                      <button class="button primary" id="frp-login-button" type="button">登录并同步</button>
+                    </div>
+                    <p class="access-message" id="frp-login-message"></p>
+                  </div>
+                  <div class="frp-login-form hidden" id="frp-session-state">
+                    <p class="field-hint">88FRP 会话保留在本次运行的 PhoneBridge 进程内；若已记住登录，重启后会自动恢复。在本机退出登录会同时清除保存的凭据。</p>
+                    <div class="access-actions">
+                      <button class="button secondary" id="frp-logout-button" type="button">退出登录</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
               <div class="two-fields">
-                <label>实例<select id="frp-instance"><option value="">先点“同步地址”读取实例</option></select></label>
+                <label>实例<select id="frp-instance"><option value="">登录后自动读取实例</option></select></label>
                 <label>PhoneBridge 隧道<select id="frp-tunnel"><option value="">自动筛选本地端口 8787</option></select></label>
               </div>
               <label class="scheme-picker">分享协议<select id="frp-scheme"><option value="http">http</option><option value="https">https</option></select></label>
               <label class="checkbox-line"><input id="frp-auto-sync" type="checkbox" checked>每 15 秒同步一次最新地址</label>
-              <p class="field-hint">PhoneBridge 只读取已经登录的 88FRP 本机服务，不保存账号或密码。</p>
+              <p class="field-hint">登录成功后自动同步已选 TCP 隧道与 3478 端口的 UDP 映射，并刷新低延迟视频链路；未选隧道时先返回实例列表。</p>
             </div>
             <div class="access-actions">
               <button class="button secondary" id="sync-public-access" type="button">同步地址</button>
@@ -215,6 +241,6 @@
   </dialog>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script src="/assets/app.js?v=experience-15" defer></script>
+  <script src="/assets/app.js?v=experience-16" defer></script>
 </body>
 </html>

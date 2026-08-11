@@ -26,8 +26,23 @@ let profileSwitchTimer = null;
 let profileSwitching = false;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
+let offerWatchdogTimer = null;
+let recoveryPending = false;
 let diagnosticLast = null;
 let webRTCStarting = false;
+// Budget for an offer to produce a usable data channel. If the negotiation
+// never completes (ICE dead, answer lost), the round is torn down and the next
+// retry is scheduled instead of waiting forever on a half-open peer.
+const OFFER_WATCHDOG_MS = 35000;
+// At most one automatic recovery round after the initial offer. Further
+// automatic attempts are circuit-broken into a stable compatibility mode with
+// a manual "retry low-latency video" path, so a dead transport can never
+// produce a reconnect storm.
+const WEBRTC_MAX_AUTO_RECOVERIES = 1;
+const WEBRTC_CIRCUIT_COOLDOWN_MS = 30000;
+let webrtcCircuitOpen = false;
+let webrtcCircuitOpenedAt = 0;
+let transportStatus = null;
 // Start every capable browser on the real-time H.264 track. The screenshot
 // renderer remains visible until the first decoded video frame and is only a
 // recovery path; making it the default adds several seconds of visible control
@@ -150,19 +165,27 @@ function useCompatibilityPreview() {
   $("#video-placeholder small").textContent = "此设备的浏览器将使用兼容画面，控制仍保持实时。";
   startFallbackFrames();
   updateRenderModeUI();
+  updateDiagnostics("compatibility");
 }
 
-function tryNativeVideo() {
+function retryLowLatencyVideo() {
+  if (session?.isDemo) return;
+  // An explicit user action always resets the WebRTC circuit breaker.
+  resetWebRTCCircuit();
   renderMode = "native";
   updateRenderModeUI();
   const video = $("#device-video");
   $("#video-placeholder").classList.remove("hidden");
   $("#video-placeholder strong").textContent = "正在尝试低延迟视频";
-  $("#video-placeholder small").textContent = "若画面仍未出现，可点“兼容画面”立即恢复。";
+  $("#video-placeholder small").textContent = "若画面仍未出现，将自动回到兼容画面。";
   video.play().catch(() => {});
   if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
     showNativeVideo(video);
+    return;
   }
+  // Start a fresh negotiation; the manual retry is allowed even while the
+  // circuit breaker is open.
+  void startWebRTC(true);
 }
 
 function showNativeVideo(video) {
@@ -174,12 +197,16 @@ function showNativeVideo(video) {
   $("#video-placeholder").classList.add("hidden");
   stopFallbackFrames();
   finishProfileSwitch(true);
+  hideReconnect();
 }
 
 async function pollSession() {
   try {
     const current = await api(`/api/public/sessions/${encodeURIComponent(token)}`);
     session = { ...session, ...current };
+    // A successful HTTP poll only proves the share endpoint is reachable; it
+    // does not by itself prove that media recovered. hideReconnect() performs
+    // the peer/data/media checks before it changes any visible state.
     hideReconnect();
   } catch (error) {
     if (error.status === 409) {
@@ -444,20 +471,113 @@ function stopTransportMonitor() {
   $("#mobile-transport").textContent = "传输 --";
 }
 
-function scheduleWebRTCRecovery() {
-  if (!joined || session?.isDemo || reconnectTimer) return;
-  if (reconnectAttempts >= 3) {
-    $("#stage-message-title").textContent = "视频通道暂不可用";
-    $("#stage-message-detail").textContent = "已保留兼容预览；请稍后点击刷新或重新打开分享链接。";
+function scheduleWebRTCRecovery(immediate = false) {
+  if (!joined || session?.isDemo) return;
+  if (webRTCStarting) {
+    // The current negotiation round is still winding down (for example an
+    // offer request that has not returned yet). Mark recovery as pending; the
+    // round's finally block starts the next attempt as soon as it finishes.
+    recoveryPending = true;
     return;
   }
+  if (webrtcCircuitOpen) {
+    // A network/visibility recovery may reopen the breaker only after the
+    // cooldown has passed; the manual button reopens it immediately.
+    if (!immediate) return;
+    if (Date.now() - webrtcCircuitOpenedAt < WEBRTC_CIRCUIT_COOLDOWN_MS) {
+      updateDiagnostics("cooldown");
+      return;
+    }
+    resetWebRTCCircuit();
+  }
+  if (reconnectTimer) {
+    if (!immediate) return;
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
   reconnectAttempts += 1;
-  const delay = Math.min(8000, 700 * (2 ** Math.min(reconnectAttempts - 1, 3)));
+  // Bounded automatic recovery: initial attempt + one recovery round. When
+  // that budget is exhausted the breaker opens and the viewer gets a stable
+  // compatibility mode plus a manual "retry low-latency video" path.
+  if (reconnectAttempts > WEBRTC_MAX_AUTO_RECOVERIES) {
+    openWebRTCCircuit();
+    return;
+  }
+  const delay = immediate ? 0 : Math.min(30000, 800 * (2 ** Math.min(reconnectAttempts, 4)));
   $("#stage-message-detail").textContent = `正在重新协商视频通道（第 ${reconnectAttempts} 次，约 ${Math.ceil(delay / 1000)} 秒）`;
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
-    if (joined) void startWebRTC(true);
+    if (!joined || session?.isDemo) return;
+    // The transport may have recovered on its own since the retry was
+    // scheduled (ICE disconnected -> connected). Do not tear down a healthy
+    // connection just because a stale timer fired.
+    if (mediaRestored()) return;
+    void startWebRTC(true);
   }, delay);
+}
+
+function openWebRTCCircuit() {
+  if (webrtcCircuitOpen) return;
+  webrtcCircuitOpen = true;
+  webrtcCircuitOpenedAt = Date.now();
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  renderMode = "compatibility";
+  startFallbackFrames();
+  updateRenderModeUI();
+  updateDiagnostics("cooldown");
+  $("#stage-message-title").textContent = "低延迟视频暂不可用";
+  $("#stage-message-detail").textContent = "自动重试已达上限，已切换为兼容画面。可稍候或点击“低延迟视频”手动重试。";
+  $("#stage-message").classList.remove("hidden");
+}
+
+function resetWebRTCCircuit() {
+  webrtcCircuitOpen = false;
+  webrtcCircuitOpenedAt = 0;
+  reconnectAttempts = 0;
+}
+
+// Tear down every artifact of the previous negotiation round before starting
+// a new one: peer connection, data channel, transport monitor, offer watchdog
+// and the native video element's old stream and handlers. This prevents
+// duplicated offers, stale timers and late callbacks from a closed connection
+// leaking into the next round.
+function cleanupWebRTC() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  clearTimeout(offerWatchdogTimer);
+  offerWatchdogTimer = null;
+  stopTransportMonitor();
+  if (dataChannel) {
+    dataChannel.onopen = null;
+    dataChannel.onclose = null;
+    dataChannel.onmessage = null;
+    dataChannel.onerror = null;
+  }
+  dataChannel = null;
+  const video = $("#device-video");
+  video.onloadeddata = null;
+  video.onplaying = null;
+  if (video.srcObject) {
+    video.srcObject.getTracks().forEach((track) => track.stop());
+    video.srcObject = null;
+  }
+  video.pause();
+  video.removeAttribute("src");
+  video.load?.();
+  if (peerConnection) {
+    peerConnection.onconnectionstatechange = null;
+    peerConnection.oniceconnectionstatechange = null;
+    peerConnection.ontrack = null;
+    peerConnection.ondatachannel = null;
+    peerConnection.close();
+    peerConnection = null;
+  }
+  webRTCFrame = null;
+  if (currentFrameURL) {
+    URL.revokeObjectURL(currentFrameURL);
+    currentFrameURL = null;
+  }
 }
 
 function tuneReceiverBuffer(profile) {
@@ -511,6 +631,50 @@ function updateCountdown() {
     : `${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
 }
 
+function updateDiagnostics(state) {
+  const summary = $("#network-summary");
+  const path = $("#diagnostic-path");
+  const rtt = $("#diagnostic-rtt");
+  const quality = $("#diagnostic-quality");
+  const video = $("#diagnostic-video");
+  const advice = $("#network-advice");
+  const clearStats = () => {
+    rtt.textContent = "--";
+    quality.textContent = "--";
+    video.textContent = "--";
+  };
+  switch (state) {
+    case "negotiating":
+      path.textContent = "正在协商 WebRTC";
+      clearStats();
+      summary.textContent = "正在协商…";
+      advice.textContent = transportStatus?.udpForwardActive
+        ? (transportStatus.udpForwardFresh ? "已启用 88FRP 公网 UDP 映射，等待首帧。" : "使用已恢复的 88FRP UDP 映射，等待首帧。")
+        : transportStatus?.turnConfigured
+          ? "未发现公网 UDP 映射，将依赖 TURN 中继。"
+          : "当前没有可用的公网 UDP 映射；若协商失败将自动使用兼容画面。";
+      break;
+    case "reconnecting":
+      path.textContent = "正在恢复连接";
+      clearStats();
+      summary.textContent = "正在重连";
+      advice.textContent = "实时链路中断，正在有界自动恢复；若恢复失败将进入兼容画面。";
+      break;
+    case "compatibility":
+      path.textContent = "兼容画面模式";
+      clearStats();
+      summary.textContent = "兼容预览";
+      advice.textContent = "当前通过 HTTP 兼容通道显示画面，控制仍保持实时。可点击“低延迟视频”尝试恢复 WebRTC。";
+      break;
+    case "cooldown":
+      path.textContent = "低延迟视频冷却中";
+      clearStats();
+      summary.textContent = "自动重试已停止";
+      advice.textContent = "为避免重连风暴已停止自动协商。稍候或点击“低延迟视频”手动重试。";
+      break;
+  }
+}
+
 function showReconnect() {
   profileSwitching = false;
   clearTimeout(profileSwitchTimer);
@@ -521,12 +685,29 @@ function showReconnect() {
   $("#stage-message-detail").textContent = "请保持页面打开";
   $("#stage-message").classList.remove("hidden");
   $("#connection-chip").innerHTML = "<i class=\"warning\"></i>正在重连";
+  updateDiagnostics("reconnecting");
+}
+
+function mediaRestored() {
+  if (session?.isDemo) return true;
+  // Only a fully opened data channel proves the negotiated media path is
+  // alive. The channel being open plus either a rendered native frame or the
+  // HTTP compatibility image on screen means the viewer sees live media.
+  if (!peerConnection || peerConnection.connectionState !== "connected") return false;
+  if (!dataChannel || dataChannel.readyState !== "open") return false;
+  return $("#device-video").classList.contains("visible") || $("#fallback-frame").classList.contains("visible");
 }
 
 function hideReconnect() {
   if (profileSwitching) return;
+  if (session?.isDemo) {
+    $("#stage-message").classList.add("hidden");
+    $("#connection-chip").innerHTML = "<i></i>演示连接";
+    return;
+  }
+  if (!mediaRestored()) return;
   $("#stage-message").classList.add("hidden");
-  if (session?.isDemo) $("#connection-chip").innerHTML = "<i></i>演示连接";
+  $("#connection-chip").innerHTML = "<i></i>WebRTC 已连接";
 }
 
 function startFallbackFrames() {
@@ -544,20 +725,30 @@ function startFallbackFrames() {
   };
   const refresh = () => {
     if (stopped || !joined) return;
+    // Never poll the ADB compatibility path while native video is healthy.
+    if ($("#device-video").classList.contains("visible")) {
+      stopFallbackFrames();
+      return;
+    }
     image.src = `/api/public/sessions/${encodeURIComponent(token)}/frame?viewer=${encodeURIComponent(viewerToken)}&r=${Date.now()}`;
   };
   image.onload = () => {
     placeholder.classList.add("hidden");
-    if (!$("#device-video").classList.contains("visible")) {
-      $("#connection-chip").innerHTML = "<i></i>兼容实时画面";
-      $("#latency-chip").textContent = "ADB 低带宽预览";
+    if ($("#device-video").classList.contains("visible")) {
+      stopFallbackFrames();
+      return;
     }
-    schedule(120);
+    $("#connection-chip").innerHTML = "<i></i>兼容实时画面";
+    $("#latency-chip").textContent = "ADB 低带宽预览";
+    // Slower cadence after a successful frame (400–700ms target) reduces
+    // ADB/HTTP contention with the native realtime path.
+    schedule(600);
   };
   image.onerror = () => {
     placeholder.classList.remove("hidden");
     placeholder.querySelector("strong").textContent = "正在重试获取手机画面";
-    schedule(800);
+    // At least 1s between retries after errors.
+    schedule(1500);
   };
   image.dataset.fallbackActive = "true";
   image._stopFallbackFrames = () => {
@@ -580,13 +771,10 @@ function prioritizeNativeVideo() {
   if (renderMode !== "native") return;
   clearTimeout(fallbackPauseTimer);
   clearTimeout(fallbackRetryTimer);
-  // Keep a first visual fallback while scrcpy starts, then stop repeated ADB
-  // screenshots so they cannot contend with the low-latency encoder.
-  fallbackPauseTimer = setTimeout(() => {
-    if (!$("#device-video").classList.contains("visible")) stopFallbackFrames();
-  }, 1200);
   // A failed native track still recovers to a usable preview instead of a
-  // blank controller.
+  // blank controller. The HTTP compatibility image stays visible until the
+  // first native video frame actually renders (showNativeVideo), so a slow
+  // encoder never leaves the screen blank while a connection heals.
   fallbackRetryTimer = setTimeout(() => {
     if (joined && !$("#device-video").classList.contains("visible")) startFallbackFrames();
   }, 3000);
@@ -595,13 +783,21 @@ function prioritizeNativeVideo() {
 async function startWebRTC(recovery = false) {
   if (webRTCStarting) return;
   webRTCStarting = true;
+  recoveryPending = false;
+  cleanupWebRTC();
   try {
     const config = await api(`/api/public/sessions/${encodeURIComponent(token)}/webrtc/config`);
+    transportStatus = config;
     transportHint = config.transportHint || "direct";
     directProbe = Boolean(config.directProbe);
-    const previousConnection = peerConnection;
-    peerConnection = null;
-    previousConnection?.close();
+	if (!config.realtimeExpected) {
+	  // The server has no public UDP mapping and no TURN path. Do not spend two
+	  // 35-second watchdog rounds on offers that cannot become reachable.
+	  openWebRTCCircuit();
+	  updateDiagnostics("compatibility");
+	  return;
+	}
+    updateDiagnostics("negotiating");
     const connection = new RTCPeerConnection({ iceServers: config.iceServers || [] });
     peerConnection = connection;
     connection.addTransceiver("video", { direction: "recvonly" });
@@ -609,15 +805,20 @@ async function startWebRTC(recovery = false) {
     dataChannel.binaryType = "arraybuffer";
     dataChannel.onopen = () => {
       if (peerConnection !== connection) return;
+      clearTimeout(offerWatchdogTimer);
+      offerWatchdogTimer = null;
       reconnectAttempts = 0;
       $("#connection-chip").innerHTML = "<i></i>WebRTC 已连接";
       $("#latency-chip").textContent = transportHint === "frp-udp" ? "FRP UDP 探测中" : "WebRTC 探测中";
       prioritizeNativeVideo();
       startTransportMonitor();
+      hideReconnect();
     };
     dataChannel.onclose = () => {
       if (peerConnection !== connection) return;
       dataChannel = null;
+      clearTimeout(offerWatchdogTimer);
+      offerWatchdogTimer = null;
       stopTransportMonitor();
       if (joined) {
         startFallbackFrames();
@@ -643,12 +844,39 @@ async function startWebRTC(recovery = false) {
     };
     connection.onconnectionstatechange = () => {
       if (peerConnection !== connection) return;
-      if (connection.connectionState === "failed" || connection.connectionState === "disconnected") {
+      if (connection.connectionState === "connected") {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+        reconnectAttempts = 0;
+        recoveryPending = false;
+        hideReconnect();
+      } else if (connection.connectionState === "failed" || connection.connectionState === "disconnected") {
         showReconnect();
         startFallbackFrames();
         scheduleWebRTCRecovery();
       }
     };
+    // If this offer never produces a usable data channel within the budget,
+    // tear the round down and schedule the next one instead of leaving a
+    // zombie peer that the UI keeps waiting on.
+    offerWatchdogTimer = setTimeout(() => {
+      offerWatchdogTimer = null;
+      if (peerConnection !== connection) return;
+      peerConnection = null;
+      if (dataChannel) {
+        dataChannel.onopen = null;
+        dataChannel.onclose = null;
+        dataChannel.onmessage = null;
+      }
+      dataChannel = null;
+      connection.onconnectionstatechange = null;
+      connection.ontrack = null;
+      stopTransportMonitor();
+      connection.close();
+      startFallbackFrames();
+      showReconnect();
+      scheduleWebRTCRecovery();
+    }, OFFER_WATCHDOG_MS);
 
     const offer = await connection.createOffer();
     await connection.setLocalDescription(offer);
@@ -663,11 +891,18 @@ async function startWebRTC(recovery = false) {
       endSession("此连接已被新的设备接管");
       return;
     }
+    if (error.status === 404 || error.status === 410) {
+      endSession("分享已经结束或到期");
+      return;
+    }
     // Fallback frames keep the controller usable when ICE/TURN is unavailable.
     startFallbackFrames();
     if (recovery || joined) scheduleWebRTCRecovery();
   } finally {
     webRTCStarting = false;
+    // A watchdog or error path marked recovery as pending while this round was
+    // still running; start the next attempt now that the round has finished.
+    if (recoveryPending && joined && !session?.isDemo) scheduleWebRTCRecovery(true);
   }
 }
 
@@ -747,15 +982,8 @@ function endSession(message) {
   clearInterval(pollTimer);
   clearTimeout(fallbackPauseTimer);
   clearTimeout(fallbackRetryTimer);
-  clearTimeout(reconnectTimer);
-  reconnectTimer = null;
-  stopTransportMonitor();
+  cleanupWebRTC();
   stopFallbackFrames();
-  peerConnection?.close();
-  peerConnection = null;
-  dataChannel = null;
-  if (currentFrameURL) URL.revokeObjectURL(currentFrameURL);
-  currentFrameURL = null;
   joined = false;
   $("#controller-shell").classList.add("hidden");
   $("#join-page").classList.remove("hidden");
@@ -814,7 +1042,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   $("#render-mode-toggle").addEventListener("click", () => {
     if (renderMode === "compatibility") {
-      tryNativeVideo();
+      retryLowLatencyVideo();
     } else {
       useCompatibilityPreview();
     }
@@ -822,4 +1050,11 @@ document.addEventListener("DOMContentLoaded", () => {
   setupPhoneInput();
   setupButtons();
   loadSession();
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    if (!joined || session?.isDemo) return;
+    // A page becoming visible usually means the network path is back; start
+    // the next negotiation immediately instead of waiting out the backoff.
+    if (!mediaRestored()) scheduleWebRTCRecovery(true);
+  });
 });

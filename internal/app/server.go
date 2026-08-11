@@ -26,7 +26,7 @@ import (
 //go:embed web/*
 var embeddedWeb embed.FS
 
-const version = "2.0"
+const version = "2.1.1"
 
 type Config struct {
 	ListenAddress string
@@ -57,12 +57,17 @@ type Server struct {
 	activeID         string
 	publicAccess     *PublicAccessManager
 	webRTCAPI        *pion.API
+	iceMu            sync.Mutex
 	iceConn          *net.UDPConn
+	iceMux           ice.UDPMux
+	icePublicHost    string
 	icePublicPort    int
+	iceUDPFresh      bool
 	sessionStorePath string
 	controlMu        sync.Mutex
 	adbRepairMu      sync.Mutex
 	controllers      map[string]*adbControlShell
+	localAdmin       *RemoteAdminService
 }
 
 func New(config Config, logger *log.Logger) *Server {
@@ -81,7 +86,7 @@ func New(config Config, logger *log.Logger) *Server {
 	}
 	sessionStorePath := filepath.Join(filepath.Dir(config.SettingsPath), "sessions.json")
 	sessions, sessionToken, activeID := loadSessionStore(sessionStorePath, time.Now())
-	return &Server{
+	server := &Server{
 		config:           config,
 		logger:           logger,
 		scrcpy:           scrcpy,
@@ -93,6 +98,17 @@ func New(config Config, logger *log.Logger) *Server {
 		controllers:      make(map[string]*adbControlShell),
 		publicAccess:     NewPublicAccessManager(config.SettingsPath, config.PublicBaseURL, listenPort(config.ListenAddress), logger),
 	}
+	// A later 88FRP recovery (manual sync or the periodic auto-sync) persists a
+	// fresh UDP mapping and notifies the server so WebRTC is advertised without
+	// a restart. The discovery itself is idempotent and concurrency-safe.
+	server.publicAccess.SetUDPForwardLocalPort(config.ICEPort)
+	server.publicAccess.SetUDPForwardListener(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		server.ensurePublicICE(ctx)
+	})
+	server.localAdmin = NewRemoteAdminService(server.publicAccess, logger)
+	return server
 }
 
 // persistSessionsLocked is best-effort. A transient disk error must never
@@ -109,11 +125,22 @@ func (server *Server) Run() error {
 	runtimeContext, cancelRuntime := context.WithCancel(context.Background())
 	defer cancelRuntime()
 	server.publicAccess.Start(runtimeContext)
-	server.startPublicICE(runtimeContext)
+	// Restore a saved 88FRP login in the background: real challenge/proof/
+	// login plus automatic Save+Sync, without blocking the main service. A
+	// failure is summarized and retried with backoff.
+	server.localAdmin.startAutoLogin(runtimeContext)
+	// Bind the local WebRTC UDP socket and advertise any fresh or recovered
+	// 88FRP UDP mapping. If no mapping is available yet, the discovery loop
+	// retries at a low frequency so a later manual/periodic 88FRP recovery
+	// enables WebRTC without restarting PhoneBridge.
+	server.ensurePublicICE(runtimeContext)
+	go server.udpDiscoveryLoop(runtimeContext)
 	defer func() {
+		server.iceMu.Lock()
 		if server.iceConn != nil {
 			_ = server.iceConn.Close()
 		}
+		server.iceMu.Unlock()
 	}()
 	mux, err := server.routes()
 	if err != nil {
@@ -143,32 +170,94 @@ func (server *Server) Run() error {
 	return err
 }
 
-// startPublicICE binds WebRTC to one local UDP socket and advertises the
-// corresponding 88FRP public UDP mapping. This preserves WebRTC's native
-// RTP/UDP media path without sending screen frames over the HTTP tunnel.
-func (server *Server) startPublicICE(ctx context.Context) {
+// ensurePublicICE binds WebRTC to one local UDP socket (idempotently) and
+// advertises the corresponding 88FRP public UDP mapping when one is available
+// — either freshly discovered or restored from the persisted last-success
+// mapping. It is safe to call from the startup path, the 30-second discovery
+// loop and the 88FRP recovery listener concurrently: the iceMu lock keeps the
+// binding single and the advertisement idempotent.
+func (server *Server) ensurePublicICE(ctx context.Context) {
+	server.iceMu.Lock()
+	defer server.iceMu.Unlock()
+	if server.iceConn == nil {
+		port := server.config.ICEPort
+		if port == 0 {
+			port = 3478
+		}
+		connection, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: port})
+		if err != nil {
+			server.logger.Printf("WebRTC UDP socket unavailable on %d: %v", port, err)
+			return
+		}
+		server.iceConn = connection
+		server.iceMux = ice.NewUDPMuxDefault(ice.UDPMuxParams{UDPConn: connection})
+		server.logger.Printf("WebRTC local UDP bound on %d", port)
+	}
+	server.advertiseUDPForwardLocked(ctx)
+}
+
+// advertiseUDPForwardLocked refreshes the advertised 88FRP UDP mapping.
+// Callers must hold iceMu. It prefers a fresh authenticated discovery and
+// falls back to the persisted mapping (marked recovered) when the 88FRP
+// management API is unavailable. Once a mapping is advertised the discovery
+// loop stops retrying.
+func (server *Server) advertiseUDPForwardLocked(ctx context.Context) {
+	if server.icePublicPort != 0 {
+		return
+	}
 	port := server.config.ICEPort
 	if port == 0 {
 		port = 3478
 	}
-	host, publicPort, err := server.publicAccess.DiscoverUDPForward(ctx, port)
+	host, publicPort, fresh, err := server.publicAccess.DiscoverUDPForward(ctx, port)
 	if err != nil {
 		server.logger.Printf("WebRTC public UDP mapping unavailable: %v", err)
 		return
 	}
-	connection, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: port})
-	if err != nil {
-		server.logger.Printf("WebRTC UDP socket unavailable on %d: %v", port, err)
-		return
-	}
-	mux := ice.NewUDPMuxDefault(ice.UDPMuxParams{UDPConn: connection})
-	settingEngine := pion.SettingEngine{}
-	settingEngine.SetICEUDPMux(mux)
-	settingEngine.SetNAT1To1IPs([]string{host}, pion.ICECandidateTypeHost)
-	server.webRTCAPI = pion.NewAPI(pion.WithSettingEngine(settingEngine))
-	server.iceConn = connection
+	server.icePublicHost = host
 	server.icePublicPort = publicPort
-	server.logger.Printf("WebRTC UDP mapped through 88FRP: %s:%d -> 127.0.0.1:%d", host, publicPort, port)
+	server.iceUDPFresh = fresh
+	server.rebuildWebRTCAPILocked()
+	label := "recovered"
+	if fresh {
+		label = "fresh"
+	}
+	server.logger.Printf("WebRTC UDP mapped through 88FRP (%s): %s:%d -> 127.0.0.1:%d", label, host, publicPort, port)
+}
+
+// rebuildWebRTCAPILocked recreates the pion API so the bound UDP mux and the
+// advertised public host apply to new negotiations.
+func (server *Server) rebuildWebRTCAPILocked() {
+	engine := pion.SettingEngine{}
+	engine.SetICEUDPMux(server.iceMux)
+	if server.icePublicHost != "" {
+		engine.SetNAT1To1IPs([]string{server.icePublicHost}, pion.ICECandidateTypeHost)
+	}
+	server.webRTCAPI = pion.NewAPI(pion.WithSettingEngine(engine))
+}
+
+// udpDiscoveryLoop retries 88FRP UDP discovery at a low frequency while no
+// mapping is advertised, then stops once WebRTC UDP is enabled.
+func (server *Server) udpDiscoveryLoop(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if server.iceUDPEnabled() {
+				return
+			}
+			server.ensurePublicICE(ctx)
+		}
+	}
+}
+
+func (server *Server) iceUDPEnabled() bool {
+	server.iceMu.Lock()
+	defer server.iceMu.Unlock()
+	return server.icePublicPort != 0
 }
 
 func (server *Server) routes() (http.Handler, error) {
@@ -184,8 +273,20 @@ func (server *Server) routes() (http.Handler, error) {
 	mux.HandleFunc("GET /api/status", server.handleStatus)
 	mux.HandleFunc("GET /api/update", server.handleUpdateCheck)
 	mux.HandleFunc("GET /api/public-access", server.handlePublicAccess)
+	// The settings write APIs are management operations but the user explicitly
+	// chose a single-user setup with no admin code: the local loopback page and
+	// the forwarded public address both write without a bearer.
 	mux.HandleFunc("PUT /api/public-access", server.handleSavePublicAccess)
 	mux.HandleFunc("POST /api/public-access/sync", server.handleSyncPublicAccess)
+	// Public remote-management API: sign in to 88FRP with a browser-derived
+	// proof (no password field ever reaches this backend).
+	mux.HandleFunc("POST /api/remote-admin/challenge", server.localAdmin.HandleChallenge)
+	mux.HandleFunc("POST /api/remote-admin/login", server.localAdmin.HandleLogin)
+	mux.HandleFunc("POST /api/remote-admin/logout", server.localAdmin.HandleLogout)
+	mux.HandleFunc("GET /api/remote-admin/status", server.localAdmin.HandleStatus)
+	// Loopback-only endpoint that persists the 88FRP login for automatic
+	// sign-in after a restart (Windows DPAPI; rejected on public requests).
+	mux.HandleFunc("POST /api/remote-admin/credentials", server.localAdmin.HandleSaveCredentials)
 	mux.HandleFunc("POST /api/devices/refresh", server.handleRefreshDevices)
 	mux.HandleFunc("POST /api/devices/repair-adb", server.handleRepairADB)
 	mux.HandleFunc("POST /api/sessions", server.handleCreateSession)
@@ -233,7 +334,9 @@ func (server *Server) refreshDevices(ctx context.Context) ADBSnapshot {
 func (server *Server) handleHealth(writer http.ResponseWriter, _ *http.Request) {
 	writeJSON(writer, http.StatusOK, map[string]any{
 		"status":  "ok",
+		"app":     "PhoneBridge",
 		"version": version,
+		"probeId": server.publicAccess.ProbeID(),
 		"time":    time.Now(),
 	})
 }
@@ -256,11 +359,20 @@ func (server *Server) handleStatus(writer http.ResponseWriter, request *http.Req
 	snapshot := server.adb
 	server.mu.Unlock()
 	publicAccess := server.publicAccess.Snapshot()
+	server.iceMu.Lock()
+	udpForwardActive := server.icePublicPort != 0
+	udpForwardFresh := server.iceUDPFresh
+	server.iceMu.Unlock()
 	cloudState := "local-ready"
 	cloudMessage := "尚未设置公网地址；分享链接仅能在本机访问。"
-	if publicAccess.State == "manual-ready" || publicAccess.State == "frp-ready" {
+	switch publicAccess.State {
+	case "manual-ready", "frp-ready", "frp-stale-ready":
 		cloudState = "public-ready"
 		cloudMessage = publicAccess.Message
+	default:
+		if publicAccess.Message != "" {
+			cloudMessage = publicAccess.Message
+		}
 	}
 
 	writeJSON(writer, http.StatusOK, map[string]any{
@@ -274,8 +386,18 @@ func (server *Server) handleStatus(writer http.ResponseWriter, request *http.Req
 		"scrcpy":        server.scrcpy,
 		"activeSession": current,
 		"webrtc":        webrtc,
-		"origin":        requestOrigin(request),
-		"publicAccess":  publicAccess,
+		"webrtcTransport": map[string]any{
+			"udpForwardActive":    udpForwardActive,
+			"udpForwardFresh":     udpForwardFresh,
+			"udpForwardRecovered": udpForwardActive && !udpForwardFresh,
+			"stunConfigured":      len(server.config.ICEServers) > 0,
+			"turnConfigured":      hasTURNServer(server.config.ICEServers),
+			"realtimeExpected":    udpForwardActive || hasTURNServer(server.config.ICEServers),
+			"reason":              webrtcTransportReason(udpForwardActive, udpForwardFresh, server.config.ICEServers),
+		},
+		"origin":       requestOrigin(request),
+		"publicAccess": publicAccess,
+		"localAdmin":   server.localAdmin.Status(),
 	})
 }
 
@@ -290,8 +412,13 @@ func (server *Server) handleSavePublicAccess(writer http.ResponseWriter, request
 		return
 	}
 	value, err := server.publicAccess.Save(request.Context(), input)
+	// Saving settings may have discovered or restored a UDP mapping; advertise
+	// it without waiting for the next 30-second discovery round.
+	server.ensurePublicICE(request.Context())
 	if err != nil {
-		writeError(writer, http.StatusBadRequest, err.Error())
+		// Return the recoverable snapshot so the web UI can keep rendering the
+		// last valid public URL even when the 88FRP management API is down.
+		writePublicAccessError(writer, http.StatusBadRequest, err.Error(), server.publicAccess.Snapshot())
 		return
 	}
 	writeJSON(writer, http.StatusOK, value)
@@ -299,8 +426,11 @@ func (server *Server) handleSavePublicAccess(writer http.ResponseWriter, request
 
 func (server *Server) handleSyncPublicAccess(writer http.ResponseWriter, request *http.Request) {
 	value, err := server.publicAccess.Sync(request.Context())
+	// A sync — successful or failed — may have discovered or restored a UDP
+	// mapping; advertise it so WebRTC works without restarting PhoneBridge.
+	server.ensurePublicICE(request.Context())
 	if err != nil {
-		writeError(writer, http.StatusBadGateway, err.Error())
+		writePublicAccessError(writer, http.StatusBadGateway, err.Error(), server.publicAccess.Snapshot())
 		return
 	}
 	writeJSON(writer, http.StatusOK, value)
@@ -720,6 +850,12 @@ func writeJSON(writer http.ResponseWriter, status int, value any) {
 
 func writeError(writer http.ResponseWriter, status int, message string) {
 	writeJSON(writer, status, map[string]any{"error": message})
+}
+
+// writePublicAccessError returns an error together with the recoverable public
+// access snapshot so a manual sync failure never discards a valid link.
+func writePublicAccessError(writer http.ResponseWriter, status int, message string, snapshot PublicAccessSnapshot) {
+	writeJSON(writer, status, map[string]any{"error": message, "publicAccess": snapshot})
 }
 
 func deviceStateMessage(state string) string {
