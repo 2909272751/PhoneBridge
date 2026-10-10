@@ -140,7 +140,21 @@ func (server *Server) handleWebRTCConfig(writer http.ResponseWriter, request *ht
 	server.iceMu.Lock()
 	udpForwardActive := server.icePublicPort != 0
 	udpForwardFresh := server.iceUDPFresh
+	icePublicHost := server.icePublicHost
+	icePublicPort := server.icePublicPort
+	iceLocalPort := server.iceLocalPortLocked()
 	server.iceMu.Unlock()
+	// The tunnel must target the port the mux is actually bound to. A mismatch
+	// means ICE traffic is forwarded to a socket nobody listens on, so the
+	// browser is told the mapping is unusable rather than left guessing.
+	udpPortMatched := true
+	if mapping := server.publicAccess.Snapshot().Settings.FRPUDPForward; mapping != nil {
+		udpPortMatched = mapping.LocalICEPort == iceLocalPort
+	}
+	if udpForwardActive && !udpPortMatched {
+		udpForwardActive = false
+		udpForwardFresh = false
+	}
 	transportHint := "direct"
 	if udpForwardActive {
 		transportHint = "frp-udp"
@@ -155,6 +169,12 @@ func (server *Server) handleWebRTCConfig(writer http.ResponseWriter, request *ht
 		"udpForwardFresh":  udpForwardFresh,
 		"realtimeExpected": udpForwardActive || hasTURNServer(server.config.ICEServers),
 		"reason":           webrtcTransportReason(udpForwardActive, udpForwardFresh, server.config.ICEServers),
+		// Non-secret public-path diagnostics: no SDP, candidate, secret or
+		// device ID is ever exposed here.
+		"udpPublicHost":  icePublicHost,
+		"udpPublicPort":  icePublicPort,
+		"udpLocalPort":   iceLocalPort,
+		"udpPortMatched": udpPortMatched,
 	})
 }
 
@@ -268,6 +288,10 @@ func (server *Server) answerWebRTCOffer(ctx context.Context, sessionID string, i
 	server.iceMu.Lock()
 	api := server.webRTCAPI
 	publicPort := server.icePublicPort
+	// The rewrite must target the port the mux is really bound to. Config.ICEPort
+	// is never populated in production, so passing it directly would fall back to
+	// 3478 and leave the private mux port advertised.
+	localPort := server.iceLocalPortLocked()
 	server.iceMu.Unlock()
 	if api == nil {
 		api = pion.NewAPI()
@@ -376,26 +400,43 @@ func (server *Server) answerWebRTCOffer(ctx context.Context, sessionID string, i
 	}
 	local := *pc.LocalDescription()
 	if publicPort != 0 {
-		local.SDP = rewriteICECandidatePort(local.SDP, server.config.ICEPort, publicPort)
+		local.SDP = rewriteICECandidatePort(local.SDP, localPort, publicPort)
 	}
 	return peer, local, nil
 }
 
-// 88FRP maps a public UDP port to a fixed local port. Pion correctly
-// advertises the public IP through NAT1To1IPs, while this final SDP rewrite
-// substitutes the mapped public port before the browser receives the answer.
+// 88FRP maps a public UDP port to the local port Pion's UDPMux is bound to.
+// Pion correctly advertises the public IP through NAT1To1IPs, while this final
+// SDP rewrite substitutes the mapped public port before the browser receives
+// the answer.
+//
+// Candidates are matched by type, not by port. The previous
+// `fields[5] == localPort` guard read as harmless because localPort defaults to
+// 3478, but Pion publishes the port of the socket it actually bound (the one
+// iceConn was opened on), and Config.ICEPort is never set by any flag, env var
+// or settings field. A rewrite that fires only when the advertised port happens
+// to equal the local port therefore silently did nothing, leaving the browser
+// pointed at a private mux port that 88FRP does not forward. ICE then stalls
+// instead of failing fast, which is the observed "connects then never works".
+//
+// A 1:1 NAT mapping replaces the address and the port together, so every host
+// candidate 88FRP forwards is rewritten. localPort is accepted only for the
+// documented no-host-candidate fallback; publicPort is the sole value written
+// into the SDP.
 func rewriteICECandidatePort(sdp string, localPort, publicPort int) string {
 	if localPort == 0 {
-		localPort = 3478
+		localPort = defaultICEPort
 	}
+	_ = localPort
 	lines := strings.Split(sdp, "\n")
+	rewritten := false
 	for index, line := range lines {
 		trimmed := strings.TrimSuffix(line, "\r")
 		if !strings.HasPrefix(trimmed, "a=candidate:") {
 			continue
 		}
 		fields := strings.Fields(trimmed)
-		if len(fields) < 8 || fields[6] != "typ" || fields[7] != "host" || fields[5] != strconv.Itoa(localPort) {
+		if len(fields) < 8 || fields[6] != "typ" || fields[7] != "host" {
 			continue
 		}
 		fields[5] = strconv.Itoa(publicPort)
@@ -404,6 +445,10 @@ func rewriteICECandidatePort(sdp string, localPort, publicPort int) string {
 			ending = "\r"
 		}
 		lines[index] = strings.Join(fields, " ") + ending
+		rewritten = true
+	}
+	if !rewritten {
+		return sdp
 	}
 	return strings.Join(lines, "\n")
 }

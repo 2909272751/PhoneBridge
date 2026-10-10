@@ -26,7 +26,12 @@ import (
 //go:embed web/*
 var embeddedWeb embed.FS
 
-const version = "2.1.1"
+const version = "2.1.2"
+
+// defaultICEPort is the local UDP port PhoneBridge binds for WebRTC when
+// Config.ICEPort is left at its zero value. It is also the port 88FRP UDP
+// proxies are expected to target.
+const defaultICEPort = 3478
 
 type Config struct {
 	ListenAddress string
@@ -170,6 +175,29 @@ func (server *Server) Run() error {
 	return err
 }
 
+// iceLocalPort returns the local UDP port the WebRTC mux is actually bound to.
+// It is the single source of truth for the 88FRP UDP mapping target and for the
+// public-port rewrite. Falling back to Config.ICEPort (which no flag, env var
+// or settings field ever sets) would report a port the mux never listened on.
+func (server *Server) iceLocalPort() int {
+	server.iceMu.Lock()
+	defer server.iceMu.Unlock()
+	return server.iceLocalPortLocked()
+}
+
+// iceLocalPortLocked reports the bound mux port. Callers must hold iceMu.
+func (server *Server) iceLocalPortLocked() int {
+	if server.iceConn != nil {
+		if address, ok := server.iceConn.LocalAddr().(*net.UDPAddr); ok && address.Port != 0 {
+			return address.Port
+		}
+	}
+	if port := server.config.ICEPort; port != 0 {
+		return port
+	}
+	return defaultICEPort
+}
+
 // ensurePublicICE binds WebRTC to one local UDP socket (idempotently) and
 // advertises the corresponding 88FRP public UDP mapping when one is available
 // — either freshly discovered or restored from the persisted last-success
@@ -182,7 +210,7 @@ func (server *Server) ensurePublicICE(ctx context.Context) {
 	if server.iceConn == nil {
 		port := server.config.ICEPort
 		if port == 0 {
-			port = 3478
+			port = defaultICEPort
 		}
 		connection, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: port})
 		if err != nil {
@@ -191,7 +219,17 @@ func (server *Server) ensurePublicICE(ctx context.Context) {
 		}
 		server.iceConn = connection
 		server.iceMux = ice.NewUDPMuxDefault(ice.UDPMuxParams{UDPConn: connection})
-		server.logger.Printf("WebRTC local UDP bound on %d", port)
+		// The mux publishes whatever port the OS actually granted, so record it
+		// as the 88FRP UDP mapping target instead of the requested (possibly
+		// zero/unsatisfiable) config value. Discovery compares this port against
+		// each tunnel's localPort, so a mismatch here is exactly what makes UDP
+		// forwarding disappear.
+		boundPort := server.iceLocalPortLocked()
+		if boundPort != port {
+			server.logger.Printf("WebRTC local UDP requested %d, bound %d", port, boundPort)
+		}
+		server.publicAccess.SetUDPForwardLocalPort(boundPort)
+		server.logger.Printf("WebRTC local UDP bound on %d", boundPort)
 	}
 	server.advertiseUDPForwardLocked(ctx)
 }
@@ -205,10 +243,7 @@ func (server *Server) advertiseUDPForwardLocked(ctx context.Context) {
 	if server.icePublicPort != 0 {
 		return
 	}
-	port := server.config.ICEPort
-	if port == 0 {
-		port = 3478
-	}
+	port := server.iceLocalPortLocked()
 	host, publicPort, fresh, err := server.publicAccess.DiscoverUDPForward(ctx, port)
 	if err != nil {
 		server.logger.Printf("WebRTC public UDP mapping unavailable: %v", err)
@@ -362,7 +397,17 @@ func (server *Server) handleStatus(writer http.ResponseWriter, request *http.Req
 	server.iceMu.Lock()
 	udpForwardActive := server.icePublicPort != 0
 	udpForwardFresh := server.iceUDPFresh
+	icePublicHost := server.icePublicHost
+	icePublicPort := server.icePublicPort
+	iceLocalPort := server.iceLocalPortLocked()
 	server.iceMu.Unlock()
+	// A tunnel targeting a different local port than the mux is bound to cannot
+	// deliver ICE traffic; report it instead of silently claiming the mapping
+	// works.
+	udpPortMatched := true
+	if mapping := publicAccess.Settings.FRPUDPForward; mapping != nil {
+		udpPortMatched = mapping.LocalICEPort == iceLocalPort
+	}
 	cloudState := "local-ready"
 	cloudMessage := "尚未设置公网地址；分享链接仅能在本机访问。"
 	switch publicAccess.State {
@@ -394,6 +439,11 @@ func (server *Server) handleStatus(writer http.ResponseWriter, request *http.Req
 			"turnConfigured":      hasTURNServer(server.config.ICEServers),
 			"realtimeExpected":    udpForwardActive || hasTURNServer(server.config.ICEServers),
 			"reason":              webrtcTransportReason(udpForwardActive, udpForwardFresh, server.config.ICEServers),
+			// Public mapping endpoint and local mux port for live diagnosis.
+			"udpPublicHost":  icePublicHost,
+			"udpPublicPort":  icePublicPort,
+			"udpLocalPort":   iceLocalPort,
+			"udpPortMatched": udpPortMatched,
 		},
 		"origin":       requestOrigin(request),
 		"publicAccess": publicAccess,

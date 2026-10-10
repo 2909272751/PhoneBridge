@@ -112,6 +112,46 @@ type PublicAccessManager struct {
 	// client" behavior. It is never persisted.
 	frpClientMu sync.RWMutex
 	frpClient   *http.Client
+	// sessionInvalidator is notified when an 88FRP management call fails with
+	// HTTP 401 on an authenticated client, so the sign-in service can drop the
+	// dead session and re-authenticate from the saved credentials. It is set
+	// once at wiring time and never persisted.
+	sessionInvalidator func(error)
+}
+
+// frpDesktopTransport stamps the 88FRP desktop marker on every outbound
+// request. `getJSON` sets the header explicitly when it has a real request
+// object, but the manager's default client is also used directly (UDP
+// discovery, health probes), so the marker is attached at the transport layer
+// too. Without it, a loopback management call is answered with HTTP 401 by
+// 88FRP's requireConsoleAuth middleware.
+type frpDesktopTransport struct{ base http.RoundTripper }
+
+func (transport frpDesktopTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	// Clone so callers' requests are never mutated.
+	cloned := request.Clone(request.Context())
+	cloned.Header.Set(frpDesktopHeader, frpDesktopHeaderValue)
+	base := transport.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(cloned)
+}
+
+// desktopHeaderClient returns an http.Client that always sends the 88FRP
+// desktop marker. When parent is non-nil its cookie jar, timeout and redirect
+// policy are preserved so a session obtained by the login flow keeps working.
+func desktopHeaderClient(parent *http.Client, timeout time.Duration) *http.Client {
+	client := &http.Client{Timeout: timeout, Transport: frpDesktopTransport{}}
+	if parent != nil {
+		client.Jar = parent.Jar
+		client.Timeout = parent.Timeout
+		client.CheckRedirect = parent.CheckRedirect
+		if parent.Transport != nil {
+			client.Transport = frpDesktopTransport{base: parent.Transport}
+		}
+	}
+	return client
 }
 
 func NewPublicAccessManager(settingsPath, initialURL string, localPort int, logger *log.Logger) *PublicAccessManager {
@@ -122,7 +162,7 @@ func NewPublicAccessManager(settingsPath, initialURL string, localPort int, logg
 		path:         settingsPath,
 		localPort:    localPort,
 		logger:       logger,
-		client:       &http.Client{Timeout: 6 * time.Second},
+		client:       desktopHeaderClient(nil, 6*time.Second),
 		udpLocalPort: 3478,
 		snapshot:     PublicAccessSnapshot{Settings: defaultPublicAccessSettings(), State: "local", Message: "使用本机地址；配置公网地址后新分享链接会自动更新。"},
 	}
@@ -288,6 +328,15 @@ func (manager *PublicAccessManager) SettingsPath() string {
 func (manager *PublicAccessManager) SetFRPClient(client *http.Client) {
 	manager.frpClientMu.Lock()
 	manager.frpClient = client
+	manager.frpClientMu.Unlock()
+}
+
+// SetSessionInvalidator registers the callback that reacts to an HTTP 401 from
+// the authenticated 88FRP management API. The sign-in service wires it so an
+// expired session triggers re-authentication instead of a permanent frp-error.
+func (manager *PublicAccessManager) SetSessionInvalidator(invalidator func(error)) {
+	manager.frpClientMu.Lock()
+	manager.sessionInvalidator = invalidator
 	manager.frpClientMu.Unlock()
 }
 
@@ -537,6 +586,9 @@ func (manager *PublicAccessManager) Sync(ctx context.Context) (PublicAccessSnaps
 	}
 	instances, err := manager.fetchInstances(ctx, serviceURL)
 	if err != nil {
+		// A 401 means the session PhoneBridge was using is dead: drop it and
+		// re-arm the auto-login before reporting the (recoverable) sync error.
+		manager.invalidateFRPSessionForError(err)
 		manager.syncFailed(settings, nil, nil, err)
 		return manager.Snapshot(), err
 	}
@@ -697,6 +749,35 @@ type frpEnvelope struct {
 	Data    json.RawMessage `json:"data"`
 }
 
+// errFRPSessionExpired marks a 88FRP management-API call that was rejected with
+// HTTP 401 even though PhoneBridge (or the user's own 88FRP login) believed the
+// session was valid. It is matched with errors.Is so the sync can drop the dead
+// session and re-authenticate instead of permanently surfacing frp-error.
+var errFRPSessionExpired = errors.New("88FRP 登录会话已失效")
+
+// newFRPSessionExpiredError builds the user-facing 401 error. The HTTP status is
+// preserved in the text because it is the symptom users report ("同步返回 http
+// 401"), while the sentinel above lets the caller react to the condition.
+func newFRPSessionExpiredError(status int) error {
+	return fmt.Errorf("%w（HTTP %d）", errFRPSessionExpired, status)
+}
+
+// isFRPSessionExpired reports whether err is the 88FRP session-expiry sentinel.
+func isFRPSessionExpired(err error) bool {
+	return errors.Is(err, errFRPSessionExpired)
+}
+
+// invalidateFRPSessionForError forwards a failed 88FRP management call to the
+// sign-in service so an expired session is dropped and re-authenticated rather
+// than cached as an authenticated state (SPEC point 4). A nil service (the
+// anonymous client used before any local login) is a no-op: an unauthenticated
+// sync must never claim the saved login is broken.
+func (manager *PublicAccessManager) invalidateFRPSessionForError(err error) {
+	if manager.sessionInvalidator != nil {
+		manager.sessionInvalidator(err)
+	}
+}
+
 // healthPayload is the response body of the lightweight GET /healthz
 // endpoint used by outbound public-URL verification.
 type healthPayload struct {
@@ -735,11 +816,19 @@ func (manager *PublicAccessManager) getJSON(ctx context.Context, address string,
 	if err != nil {
 		return err
 	}
+	// 88FRP authenticates a loopback management call either with a console
+	// session cookie or with the desktop-client marker. Sending the marker
+	// makes PhoneBridge behave exactly like the 88FRP Windows client and
+	// removes the 401 on /api/instances when no session is held.
+	request.Header.Set(frpDesktopHeader, frpDesktopHeaderValue)
 	response, err := manager.frpHTTPClient().Do(request)
 	if err != nil {
 		return err
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusUnauthorized {
+		return newFRPSessionExpiredError(response.StatusCode)
+	}
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		return fmt.Errorf("88FRP 本机服务返回 HTTP %d", response.StatusCode)
 	}

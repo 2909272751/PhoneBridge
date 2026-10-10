@@ -36,6 +36,40 @@ const (
 	frpPBKDF2Iterations = 10000
 	// frpPBKDF2KeyLength is the derived key length (SHA-256 output size).
 	frpPBKDF2KeyLength = 32
+	// frpDesktopHeader is the 88FRP desktop-client marker. The 88FRP console
+	// only requires a login session for browsers: its `requireConsoleAuth`
+	// middleware lets a request from the loopback peer through untouched when
+	// it carries `X-88FRP-Desktop: 1`. The Windows 88FRP client (and the
+	// settings page shipped with it) always sends it, so every management call
+	// works without a console session. PhoneBridge talks to the same loopback
+	// service and must send it too:
+	//
+	//	GET /api/console-auth/challenge -> 200 (public route, no auth at all)
+	//	GET /api/instances             -> 401 without the header / session
+	//	GET /api/instances             -> 200 with the header
+	//
+	// Without it, PhoneBridge's very first `/api/instances` sync already
+	// returns HTTP 401, which is exactly the reported "同步地址失败 / 401".
+	frpDesktopHeader = "X-88FRP-Desktop"
+	// frpDesktopHeaderValue is the only value 88FRP accepts (strict "1").
+	frpDesktopHeaderValue = "1"
+	// frpSessionCookieName is the 88FRP console session cookie. The session
+	// route is the fallback for a non-desktop peer: 88FRP sets
+	// `88frp_console=<token>; Max-Age=...; Path=/; HttpOnly; SameSite=Strict`.
+	// PhoneBridge's in-memory jar keeps it so a cookie-based session keeps
+	// working even when the desktop bypass is unavailable.
+	frpSessionCookieName = "88frp_console"
+	// frpChallengeEndpoint and frpLoginEndpoint are the 88FRP console-auth
+	// routes. They sit before the `app.use("/api", requireConsoleAuth)` guard
+	// and are therefore reachable without any session.
+	frpChallengeEndpoint = "/api/console-auth/challenge"
+	frpLoginEndpoint     = "/api/console-auth/login"
+	// frpRememberTTL is 88FRP's session lifetime when the login asks to be
+	// remembered (REMEMBER_TTL_MS = 5 * 365 days) instead of the 24-hour
+	// default (SESSION_TTL_MS). The protocol reference is the real
+	// console-login.js, whose login body carries `remember`, so PhoneBridge
+	// asks for the long-lived session that the user's settings page implies.
+	frpRememberTTL = 5 * 365 * 24 * time.Hour
 )
 
 // LocalAdminStatus is the non-secret information the main /api/status exposes
@@ -96,6 +130,16 @@ type RemoteAdminService struct {
 	// carries only a log-safe summary and is never exposed over the API.
 	autoLoginState string
 	autoLoginErr   string
+	// autoLoginCancel cancels the running background auto-login loop. It is
+	// nil while no loop is active, so it doubles as the "a loop is running"
+	// flag used by frpSessionExpired to avoid stacking retry loops after a
+	// 401.
+	autoLoginCancel context.CancelFunc
+	// onSessionExpired is invoked (without holding service.mu) when the 88FRP
+	// management API answers 401 while PhoneBridge believed it was signed in.
+	// It exists so the session-expiry reaction can be exercised in tests
+	// without starting the background retry loop.
+	onSessionExpired func()
 }
 
 // NewRemoteAdminService creates the 88FRP sign-in service. The 88FRP session
@@ -113,6 +157,9 @@ func NewRemoteAdminService(publicAccess *PublicAccessManager, logger *log.Logger
 	}
 	if publicAccess != nil {
 		service.store = newCredentialStore(publicAccess.SettingsPath())
+		// A 401 during a sync means the session died; let the sign-in service
+		// drop it and re-authenticate from the saved credentials.
+		publicAccess.SetSessionInvalidator(service.invalidateFRPSession)
 	}
 	return service
 }
@@ -463,6 +510,63 @@ func (service *RemoteAdminService) localOriginOnly(request *http.Request) bool {
 	return parsed.Host == host
 }
 
+// invalidateFRPSession reacts to a failed authenticated 88FRP management call.
+// A 401 means the server-side session the management API authenticates with is
+// gone, so the stale session is dropped and re-authentication is re-armed; any
+// other error leaves the session alone.
+//
+// An anonymous sync (PhoneBridge never signed in) is deliberately a no-op: no
+// session existed to expire, and a 401 there is the ordinary "controller not
+// logged in" state rather than a broken user login. Distinguishing the two is
+// what keeps /api/status honest.
+func (service *RemoteAdminService) invalidateFRPSession(err error) {
+	if !isFRPSessionExpired(err) {
+		return
+	}
+	service.mu.Lock()
+	hadSession := service.authenticated || service.cookieJar != nil || service.frpClient != nil
+	service.mu.Unlock()
+	if !hadSession {
+		return
+	}
+	service.expireFRPSession()
+}
+
+// expireFRPSession drops a session that 88FRP has rejected and re-arms the
+// auto-login retry loop when saved credentials can restore it. It is the single
+// place that converts "401 on an authenticated call" into recovery.
+func (service *RemoteAdminService) expireFRPSession() {
+	service.clearFRPSession()
+	service.mu.Lock()
+	credentialsAvailable := service.store != nil && service.store.HasSaved()
+	autoLoginState := service.autoLoginState
+	service.mu.Unlock()
+	if !credentialsAvailable {
+		// Without saved credentials only an explicit user login can restore
+		// the session; never fabricate an authenticated state.
+		return
+	}
+	if autoLoginState == "running" {
+		return
+	}
+	if service.onSessionExpired != nil {
+		service.onSessionExpired()
+		return
+	}
+	// Re-arm the retry loop; the previous run already returned (done/failed).
+	ctx, cancel := context.WithCancel(context.Background())
+	service.mu.Lock()
+	if service.autoLoginCancel != nil {
+		service.mu.Unlock()
+		cancel()
+		return
+	}
+	service.autoLoginCancel = cancel
+	service.autoLoginState = "idle"
+	service.mu.Unlock()
+	service.startAutoLogin(ctx)
+}
+
 // --- 88FRP session and proxying ---
 
 // frpSessionClient returns the in-memory cookie-jar HTTP client shared by the
@@ -479,7 +583,10 @@ func (service *RemoteAdminService) frpSessionClient() (*http.Client, http.Cookie
 		service.cookieJar = jar
 	}
 	if service.frpClient == nil {
-		service.frpClient = &http.Client{Timeout: 6 * time.Second, Jar: service.cookieJar}
+		// The desktop marker authenticates every 88FRP management call from the
+		// loopback peer; the jar keeps any 88frp_console session 88FRP returns.
+		service.frpClient = desktopHeaderClient(&http.Client{Timeout: 6 * time.Second, Jar: service.cookieJar}, 6*time.Second)
+		service.frpClient.Jar = service.cookieJar
 	}
 	return service.frpClient, service.cookieJar, nil
 }
@@ -491,10 +598,13 @@ func (service *RemoteAdminService) proxyChallenge(ctx context.Context, client *h
 	// Content-Type and no username: the server returns the same challenge for
 	// any account, and username is bound to the attempt here in PhoneBridge.
 	// Sending a JSON POST body makes 88FRP return HTTP 401.
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, serviceURL+"/api/console-auth/challenge", nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, serviceURL+frpChallengeEndpoint, nil)
 	if err != nil {
 		return nil, err
 	}
+	// The challenge route itself is public, but the desktop marker keeps every
+	// 88FRP call in this service consistent with the real Windows client.
+	request.Header.Set(frpDesktopHeader, frpDesktopHeaderValue)
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, err
@@ -551,22 +661,36 @@ func (service *RemoteAdminService) proxyChallenge(ctx context.Context, client *h
 
 // proxyLogin completes the 88FRP console-auth flow with username, proof and
 // challengeId. The plaintext password never leaves the browser; this process
-// only forwards the derived proof. The server's Set-Cookie is captured by the
-// in-memory jar for subsequent API calls.
+// only forwards the derived proof. The server's Set-Cookie, when present, is
+// captured by the in-memory jar for subsequent API calls.
+//
+// The body mirrors the real console-login.js shape `{challengeId, username,
+// proof, remember}`. `remember` is not cosmetic: 88FRP expires the session
+// after 24 hours when it is absent/false and after 5 years when it is true, so
+// omitting it leaves PhoneBridge holding a session that silently dies a day
+// later and makes every later sync return HTTP 401.
+//
+// A missing Set-Cookie is deliberately NOT an error. The real 88FRP login does
+// set `88frp_console`, but the desktop marker PhoneBridge sends on every
+// management call is by itself sufficient for the whole /api surface
+// (isDesktopRequest short-circuits requireConsoleAuth), so a session cookie is
+// a bonus rather than a precondition.
 func (service *RemoteAdminService) proxyLogin(ctx context.Context, client *http.Client, serviceURL, username, proof, challengeID string) error {
-	body, err := json.Marshal(map[string]string{
+	body, err := json.Marshal(map[string]any{
 		"username":    username,
 		"proof":       proof,
 		"challengeId": challengeID,
+		"remember":    true,
 	})
 	if err != nil {
 		return err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, serviceURL+"/api/console-auth/login", bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, serviceURL+frpLoginEndpoint, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(frpDesktopHeader, frpDesktopHeaderValue)
 	response, err := client.Do(request)
 	if err != nil {
 		return err
@@ -589,8 +713,33 @@ func (service *RemoteAdminService) proxyLogin(ctx context.Context, client *http.
 	return nil
 }
 
+// jarHasFRPSession reports whether the cookie jar now holds a non-empty 88FRP
+// console session cookie for the service. It only inspects cookie metadata —
+// never the token value. It is not a login precondition (the desktop marker
+// authenticates every management call by itself) but it lets /api/status and
+// the tests distinguish "holds a session" from "only received a 200".
+func jarHasFRPSession(client *http.Client, serviceURL string) bool {
+	if client == nil || client.Jar == nil {
+		return false
+	}
+	parsed, err := url.Parse(serviceURL)
+	if err != nil {
+		return false
+	}
+	for _, cookie := range client.Jar.Cookies(parsed) {
+		if cookie.Name == frpSessionCookieName && strings.TrimSpace(cookie.Value) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // clearFRPSession drops the in-memory 88FRP session and detaches it from the
 // public-access manager so later syncs fall back to the anonymous client.
+//
+// Callers that only invalidate an expired server-side session and intend to
+// re-authenticate from the saved credentials must use frpSessionExpired, which
+// additionally re-arms the auto-login.
 func (service *RemoteAdminService) clearFRPSession() {
 	service.mu.Lock()
 	service.cookieJar = nil
@@ -687,6 +836,11 @@ func deriveFRPProofServer(password, username, challenge string, iterations int, 
 // kept; the status API never sees it (SPEC point 4).
 func (service *RemoteAdminService) startAutoLogin(ctx context.Context) {
 	go func() {
+		defer func() {
+			service.mu.Lock()
+			service.autoLoginCancel = nil
+			service.mu.Unlock()
+		}()
 		delay := 5 * time.Second
 		for {
 			err := service.autoLoginOnce(ctx)
