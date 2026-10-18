@@ -107,7 +107,7 @@ func (server *Server) handleStreamProfile(writer http.ResponseWriter, request *h
 	}
 	if !viewerOwnsSession(request, session) {
 		server.mu.Unlock()
-		writeError(writer, http.StatusConflict, "控制已被新的连接接管")
+		writeControlConflict(writer, *session)
 		return
 	}
 	previousProfile, previousSize, previousFPS := session.StreamProfile, session.StreamMaxSize, session.StreamMaxFPS
@@ -134,7 +134,7 @@ func (server *Server) handleWebRTCConfig(writer http.ResponseWriter, request *ht
 		return
 	}
 	if !viewerOwnsSession(request, &session) {
-		writeError(writer, http.StatusConflict, "控制已被新的连接接管")
+		writeControlConflict(writer, session)
 		return
 	}
 	server.iceMu.Lock()
@@ -225,7 +225,7 @@ func (server *Server) handleWebRTCOffer(writer http.ResponseWriter, request *htt
 	}
 	if !viewerOwnsSession(request, session) {
 		server.mu.Unlock()
-		writeError(writer, http.StatusConflict, "控制已被新的连接接管")
+		writeControlConflict(writer, *session)
 		return
 	}
 	oldPeer := server.webrtcPeers[session.ID]
@@ -251,7 +251,11 @@ func (server *Server) handleWebRTCOffer(writer http.ResponseWriter, request *htt
 	if status != 0 {
 		server.mu.Unlock()
 		peer.close()
-		writeError(writer, status, message)
+		if status == http.StatusConflict && current != nil {
+			writeControlConflict(writer, *current)
+		} else {
+			writeError(writer, status, message)
+		}
 		return
 	}
 	server.webrtcPeers[sessionID] = peer

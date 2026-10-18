@@ -1,5 +1,5 @@
 #define AppName "PhoneBridge"
-#define AppVersion "2.2.0"
+#define AppVersion "2.3.0"
 #define AppPublisher "PhoneBridge"
 
 [Setup]

@@ -38,7 +38,7 @@
 
   <div class="controller-shell hidden" id="controller-shell">
     <header class="controller-topbar">
-      <div class="controller-brand"><strong>PhoneBridge <small class="web-version">v2.2.0</small></strong><small class="mobile-transport" id="mobile-transport">传输 --</small><span id="controller-device-name">Android设备</span></div>
+      <div class="controller-brand"><strong>PhoneBridge <small class="web-version">v2.3.0</small></strong><small class="mobile-transport" id="mobile-transport">传输 --</small><span id="controller-device-name">Android设备</span></div>
       <div class="connection-chips">
         <span class="connection-chip" id="connection-chip"><i></i>建立连接</span>
         <span class="latency-chip" id="latency-chip">演示</span>
@@ -121,12 +121,24 @@
         </div>
       </div>
       <details class="network-diagnostics" id="network-diagnostics">
-        <summary>网络诊断 <span id="network-summary">正在测量…</span></summary>
+        <summary>网络状态 <span id="network-summary">正在测量…</span></summary>
         <div class="network-diagnostic-grid">
           <span>实际路径<strong id="diagnostic-path">正在协商</strong></span>
           <span>往返延迟<strong id="diagnostic-rtt">--</strong></span>
           <span>抖动 / 丢包<strong id="diagnostic-quality">--</strong></span>
-          <span>接收 / 解码<strong id="diagnostic-video">--</strong></span>
+          <span>接收码率<strong id="diagnostic-bitrate">--</strong></span>
+          <span>分辨率<strong id="diagnostic-resolution">--</strong></span>
+          <span>解码帧率<strong id="diagnostic-video">--</strong></span>
+          <span>丢帧 / 冻结<strong id="diagnostic-drops">--</strong></span>
+          <span>重连<strong id="diagnostic-reconnect">--</strong></span>
+        </div>
+        <canvas id="network-sparkline" class="network-sparkline" width="720" height="120" aria-label="最近 60 秒网络趋势"></canvas>
+        <div class="network-recommendation" id="network-recommendation">
+          <div><strong>建议</strong><span id="network-recommendation-text">等待实时数据</span></div>
+          <button type="button" class="network-action" id="apply-network-recommendation" disabled>应用建议</button>
+        </div>
+        <div class="network-actions">
+          <button type="button" class="network-action" id="copy-network-diagnostics">复制诊断</button>
         </div>
         <p id="network-advice">保持页面打开，首帧到达后会显示真实链路指标。</p>
       </details>
@@ -143,6 +155,17 @@
   </div>
 
   <div class="toast dark" id="toast" role="status" aria-live="polite"></div>
-  <script src="/assets/controller.js?v=experience-20" defer></script>
+  <div class="takeover-overlay hidden" id="takeover-overlay" role="dialog" aria-modal="true" aria-labelledby="takeover-title">
+    <div class="takeover-card">
+      <span class="eyebrow">控制权已转移</span>
+      <h2 id="takeover-title">另一台设备正在控制手机</h2>
+      <p id="takeover-message">另一台设备已取得控制权。你可以重新取得控制，或退出本次观看。</p>
+      <div class="takeover-actions">
+        <button class="button secondary" type="button" id="takeover-exit">退出</button>
+        <button class="button primary" type="button" id="takeover-reclaim">重新取得控制</button>
+      </div>
+    </div>
+  </div>
+  <script src="/assets/controller.js?v=experience-21" defer></script>
 </body>
 </html>

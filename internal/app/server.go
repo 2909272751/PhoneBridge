@@ -26,7 +26,7 @@ import (
 //go:embed web/*
 var embeddedWeb embed.FS
 
-const version = "2.2.0"
+const version = "2.3.0"
 
 // defaultICEPort is the local UDP port PhoneBridge binds for WebRTC when
 // Config.ICEPort is left at its zero value. It is also the port 88FRP UDP
@@ -626,7 +626,7 @@ func (server *Server) handlePublicSession(writer http.ResponseWriter, request *h
 		return
 	}
 	if suppliedViewerToken(request) != "" && !viewerOwnsSession(request, &session) {
-		writeError(writer, http.StatusConflict, "控制已被新的连接接管")
+		writeControlConflict(writer, session)
 		return
 	}
 	writeJSON(writer, http.StatusOK, publicGuestSession(session, false))
@@ -634,7 +634,8 @@ func (server *Server) handlePublicSession(writer http.ResponseWriter, request *h
 
 func (server *Server) handleJoinSession(writer http.ResponseWriter, request *http.Request) {
 	var input struct {
-		Code string `json:"code"`
+		Code        string `json:"code"`
+		ViewerToken string `json:"viewerToken"`
 	}
 	if err := decodeJSON(request, &input); err != nil {
 		writeError(writer, http.StatusBadRequest, "访问码格式无效")
@@ -642,11 +643,6 @@ func (server *Server) handleJoinSession(writer http.ResponseWriter, request *htt
 	}
 
 	token := request.PathValue("token")
-	viewerToken, err := randomToken(18)
-	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "无法建立控制连接")
-		return
-	}
 	server.mu.Lock()
 	session, ok := server.sessionByTokenLocked(token, time.Now())
 	if !ok {
@@ -658,6 +654,22 @@ func (server *Server) handleJoinSession(writer http.ResponseWriter, request *htt
 		server.mu.Unlock()
 		writeError(writer, http.StatusUnauthorized, "访问码不正确")
 		return
+	}
+	// A browser refresh sends its existing viewer token so it can reattach to
+	// the same lease. Only a different/empty token takes control away from the
+	// previous viewer and is treated as a real takeover.
+	requestedToken := strings.TrimSpace(input.ViewerToken)
+	reusingLease := requestedToken != "" && requestedToken == session.ViewerToken
+	viewerToken := requestedToken
+	if !reusingLease {
+		newToken, err := randomToken(18)
+		if err != nil {
+			server.mu.Unlock()
+			writeError(writer, http.StatusInternalServerError, "无法建立控制连接")
+			return
+		}
+		viewerToken = newToken
+		session.ControllerLabel = controllerLabelFromRequest(request)
 	}
 	oldPeer := server.webrtcPeers[session.ID]
 	delete(server.webrtcPeers, session.ID)
@@ -713,7 +725,7 @@ func (server *Server) handleControlEvent(writer http.ResponseWriter, request *ht
 	}
 	if !viewerOwnsSession(request, session) {
 		server.mu.Unlock()
-		writeError(writer, http.StatusConflict, "控制已被新的连接接管")
+		writeControlConflict(writer, *session)
 		return
 	}
 	now := time.Now()
@@ -760,7 +772,7 @@ func (server *Server) handleFrame(writer http.ResponseWriter, request *http.Requ
 	}
 	if !viewerOwnsSession(request, session) {
 		server.mu.Unlock()
-		writeError(writer, http.StatusConflict, "控制已被新的连接接管")
+		writeControlConflict(writer, *session)
 		return
 	}
 	deviceID, demo := session.DeviceID, session.IsDemo
@@ -833,24 +845,69 @@ func publicOwnerSession(session Session) Session {
 
 func publicGuestSession(session Session, joined bool) map[string]any {
 	response := map[string]any{
-		"id":             session.ID,
-		"deviceName":     session.DeviceName,
-		"state":          session.State,
-		"mode":           session.Mode,
-		"requireCode":    session.RequireCode,
-		"allowClipboard": session.AllowClipboard,
-		"allowAudio":     session.AllowAudio,
-		"isDemo":         session.IsDemo,
-		"viewerState":    session.ViewerState,
-		"connectionMode": session.ConnectionMode,
-		"createdAt":      session.CreatedAt,
-		"expiresAt":      session.ExpiresAt,
-		"joined":         joined,
+		"id":              session.ID,
+		"deviceName":      session.DeviceName,
+		"state":           session.State,
+		"mode":            session.Mode,
+		"requireCode":     session.RequireCode,
+		"allowClipboard":  session.AllowClipboard,
+		"allowAudio":      session.AllowAudio,
+		"isDemo":          session.IsDemo,
+		"viewerState":     session.ViewerState,
+		"controllerLabel": session.ControllerLabel,
+		"connectionMode":  session.ConnectionMode,
+		"createdAt":       session.CreatedAt,
+		"expiresAt":       session.ExpiresAt,
+		"joined":          joined,
 	}
 	if joined {
 		response["viewerToken"] = session.ViewerToken
 	}
 	return response
+}
+
+// controllerLabelFromRequest returns a short, non-identifying browser/OS label.
+// It intentionally does not expose IP addresses or device identifiers.
+func controllerLabelFromRequest(request *http.Request) string {
+	userAgent := strings.ToLower(request.UserAgent())
+	browser := "浏览器"
+	switch {
+	case strings.Contains(userAgent, "edg/"):
+		browser = "Edge"
+	case strings.Contains(userAgent, "firefox/"):
+		browser = "Firefox"
+	case strings.Contains(userAgent, "chrome/") || strings.Contains(userAgent, "crios/"):
+		browser = "Chrome"
+	case strings.Contains(userAgent, "safari/"):
+		browser = "Safari"
+	}
+	system := "设备"
+	switch {
+	case strings.Contains(userAgent, "windows"):
+		system = "Windows"
+	case strings.Contains(userAgent, "android"):
+		system = "Android"
+	case strings.Contains(userAgent, "iphone") || strings.Contains(userAgent, "ipad"):
+		system = "iOS"
+	case strings.Contains(userAgent, "mac os"):
+		system = "macOS"
+	case strings.Contains(userAgent, "linux"):
+		system = "Linux"
+	}
+	return browser + " · " + system
+}
+
+func writeControlConflict(writer http.ResponseWriter, session Session) {
+	label := strings.TrimSpace(session.ControllerLabel)
+	if label == "" {
+		label = "另一台设备"
+	}
+	writeJSON(writer, http.StatusConflict, map[string]any{
+		"error":           "控制已被新的设备接管",
+		"code":            "control_taken_over",
+		"canReclaim":      true,
+		"controllerLabel": label,
+	})
 }
 
 func suppliedViewerToken(request *http.Request) string {

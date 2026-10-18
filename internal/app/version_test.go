@@ -14,7 +14,7 @@ import (
 //  2. the remote-control page's static fallback badge (controller.html);
 //  3. the Inno Setup AppVersion, which also drives the installer filename.
 func TestVersionConsistency(t *testing.T) {
-	const want = "2.2.0"
+	const want = "2.3.0"
 
 	if version != want {
 		t.Errorf("server version = %q, want %q", version, want)

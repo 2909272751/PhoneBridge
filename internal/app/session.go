@@ -9,29 +9,30 @@ import (
 )
 
 type Session struct {
-	ID             string     `json:"id"`
-	Token          string     `json:"-"`
-	AccessCode     string     `json:"accessCode,omitempty"`
-	DeviceID       string     `json:"deviceId"`
-	DeviceName     string     `json:"deviceName"`
-	State          string     `json:"state"`
-	Mode           string     `json:"mode"`
-	RequireCode    bool       `json:"requireCode"`
-	AllowClipboard bool       `json:"allowClipboard"`
-	AllowAudio     bool       `json:"allowAudio"`
-	StreamProfile  string     `json:"streamProfile"`
-	StreamMaxSize  int        `json:"streamMaxSize,omitempty"`
-	StreamMaxFPS   int        `json:"streamMaxFps,omitempty"`
-	IsDemo         bool       `json:"isDemo"`
-	ViewerState    string     `json:"viewerState"`
-	ConnectionMode string     `json:"connectionMode"`
-	CreatedAt      time.Time  `json:"createdAt"`
-	ExpiresAt      *time.Time `json:"expiresAt,omitempty"`
-	StoppedAt      *time.Time `json:"stoppedAt,omitempty"`
-	ShareURL       string     `json:"shareUrl"`
-	LastEventAt    *time.Time `json:"lastEventAt,omitempty"`
-	ViewerToken    string     `json:"-"`
-	pointerStart   *PointerPoint
+	ID              string     `json:"id"`
+	Token           string     `json:"-"`
+	AccessCode      string     `json:"accessCode,omitempty"`
+	DeviceID        string     `json:"deviceId"`
+	DeviceName      string     `json:"deviceName"`
+	State           string     `json:"state"`
+	Mode            string     `json:"mode"`
+	RequireCode     bool       `json:"requireCode"`
+	AllowClipboard  bool       `json:"allowClipboard"`
+	AllowAudio      bool       `json:"allowAudio"`
+	StreamProfile   string     `json:"streamProfile"`
+	StreamMaxSize   int        `json:"streamMaxSize,omitempty"`
+	StreamMaxFPS    int        `json:"streamMaxFps,omitempty"`
+	IsDemo          bool       `json:"isDemo"`
+	ViewerState     string     `json:"viewerState"`
+	ControllerLabel string     `json:"controllerLabel,omitempty"`
+	ConnectionMode  string     `json:"connectionMode"`
+	CreatedAt       time.Time  `json:"createdAt"`
+	ExpiresAt       *time.Time `json:"expiresAt,omitempty"`
+	StoppedAt       *time.Time `json:"stoppedAt,omitempty"`
+	ShareURL        string     `json:"shareUrl"`
+	LastEventAt     *time.Time `json:"lastEventAt,omitempty"`
+	ViewerToken     string     `json:"-"`
+	pointerStart    *PointerPoint
 }
 
 type PointerPoint struct {

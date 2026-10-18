@@ -3,6 +3,10 @@ const token = window.location.pathname.split("/").filter(Boolean).pop();
 let session = null;
 let joined = false;
 let viewerToken = "";
+const viewerStorageKey = `phonebridge.viewer.${token}`;
+let lastAccessCode = "";
+let takeoverBlocked = false;
+let takeoverInfo = null;
 let countdownTimer = null;
 let pollTimer = null;
 let pointerDown = false;
@@ -29,6 +33,9 @@ let reconnectAttempts = 0;
 let offerWatchdogTimer = null;
 let recoveryPending = false;
 let diagnosticLast = null;
+let networkHistory = [];
+let networkRecommendation = null;
+let networkState = "connecting";
 let webRTCStarting = false;
 // Budget for an offer to produce a usable data channel. If the negotiation
 // never completes (ICE dead, answer lost), the round is torn down and the next
@@ -59,9 +66,14 @@ async function api(url, options = {}) {
   if (!response.ok) {
     const error = new Error(payload.error || `请求失败（${response.status}）`);
     error.status = response.status;
+    error.payload = payload;
     throw error;
   }
   return payload;
+}
+
+function isControlTakenOver(error) {
+  return error?.status === 409 || error?.payload?.code === "control_taken_over";
 }
 
 async function loadSession() {
@@ -92,14 +104,7 @@ async function joinSession(event) {
   $("#join-error").classList.add("hidden");
   try {
     const code = $("#access-code").value.replace(/\D/g, "");
-    const result = await api(`/api/public/sessions/${encodeURIComponent(token)}/join`, {
-      method: "POST",
-      body: JSON.stringify({ code }),
-    });
-    session = result;
-    viewerToken = result.viewerToken || "";
-    joined = true;
-    showController();
+    await performJoin(code, false);
   } catch (error) {
     $("#join-error").textContent = error.message;
     $("#join-error").classList.remove("hidden");
@@ -109,7 +114,73 @@ async function joinSession(event) {
   }
 }
 
+async function performJoin(code, forceTakeover) {
+  let storedViewer = "";
+  try {
+    storedViewer = sessionStorage.getItem(viewerStorageKey) || "";
+  } catch {
+    storedViewer = "";
+  }
+  const result = await api(`/api/public/sessions/${encodeURIComponent(token)}/join`, {
+    method: "POST",
+    body: JSON.stringify({ code, viewerToken: forceTakeover ? "" : storedViewer }),
+  });
+  session = result;
+  viewerToken = result.viewerToken || "";
+  lastAccessCode = code;
+  takeoverBlocked = false;
+  takeoverInfo = null;
+  try {
+    if (viewerToken) sessionStorage.setItem(viewerStorageKey, viewerToken);
+    else sessionStorage.removeItem(viewerStorageKey);
+  } catch {}
+  hideTakeover();
+  joined = true;
+  showController();
+}
+
+async function reclaimControl() {
+  const button = $("#takeover-reclaim");
+  if (!button) return;
+  button.disabled = true;
+  const original = button.textContent;
+  button.textContent = "正在重新取得…";
+  try {
+    await performJoin(lastAccessCode, true);
+    showToast("已重新取得控制权");
+  } catch (error) {
+    $("#takeover-message").textContent = error.message || "重新取得控制失败，请稍后再试。";
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+function showTakeover(info = {}) {
+  takeoverBlocked = true;
+  takeoverInfo = info || {};
+  clearInterval(countdownTimer);
+  countdownTimer = null;
+  clearInterval(pollTimer);
+  pollTimer = null;
+  cleanupWebRTC();
+  stopFallbackFrames();
+  joined = false;
+  const label = takeoverInfo.controllerLabel || "另一台设备";
+  $("#takeover-message").textContent = `${label} 已取得控制权。你可以重新取得控制，或退出本次观看。`;
+  $("#takeover-overlay").classList.remove("hidden");
+  $("#connection-chip").innerHTML = "<i class=\"warning\"></i>控制权已转移";
+  $("#stage-message").classList.add("hidden");
+}
+
+function hideTakeover() {
+  takeoverBlocked = false;
+  takeoverInfo = null;
+  $("#takeover-overlay")?.classList.add("hidden");
+}
+
 function showController() {
+  hideTakeover();
   selectedProfile = session.streamProfile && session.streamProfile !== "auto" ? session.streamProfile : "hd";
   if ([...$("#stream-profile").options].some((option) => option.value === selectedProfile)) {
     $("#stream-profile").value = selectedProfile;
@@ -209,8 +280,8 @@ async function pollSession() {
     // the peer/data/media checks before it changes any visible state.
     hideReconnect();
   } catch (error) {
-    if (error.status === 409) {
-      endSession("此连接已被新的设备接管");
+    if (isControlTakenOver(error)) {
+      showTakeover(error.payload);
       return;
     }
     if (error.status === 404 || error.status === 410) {
@@ -222,7 +293,7 @@ async function pollSession() {
 }
 
 async function sendControl(type, detail = {}) {
-  if (!joined || session.mode !== "control") return;
+  if (!joined || takeoverBlocked || session.mode !== "control") return;
   if (dataChannel?.readyState === "open") {
     try {
       dataChannel.send(JSON.stringify({ kind: "control", type, ...detail }));
@@ -238,8 +309,8 @@ async function sendControl(type, detail = {}) {
     });
     if (session.isDemo) animateDemoControl(type, detail);
   } catch (error) {
-    if (error.status === 409) {
-      endSession("此连接已被新的设备接管");
+    if (isControlTakenOver(error)) {
+      showTakeover(error.payload);
     } else if (error.status === 410) {
       endSession("分享已经结束或到期");
     } else {
@@ -384,23 +455,52 @@ async function applyStreamProfile(profile, automatic = true, custom = null) {
   }
 }
 
-function updateTransportIndicator(reports, pair, rtt) {
-  if (!pair) return;
+let lastReconnectReason = "";
+function isPrivateAddress(value) {
+  const address = String(value || "").toLowerCase();
+  if (!address) return false;
+  if (address === "::1" || address.startsWith("fe80") || address.startsWith("fc") || address.startsWith("fd")) return true;
+  const parts = address.split(".").map(Number);
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
+  return parts[0] === 10 || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) || (parts[0] === 192 && parts[1] === 168) || parts[0] === 127 || (parts[0] === 169 && parts[1] === 254);
+}
+
+function transportPathLabel(reports, pair) {
+  if (!pair) return "正在协商";
   const local = pair.localCandidateId ? reports.get(pair.localCandidateId) : null;
   const remote = pair.remoteCandidateId ? reports.get(pair.remoteCandidateId) : null;
-  const usesTURN = local?.candidateType === "relay" || remote?.candidateType === "relay";
-  let path = "WebRTC 直连";
-  if (usesTURN) path = "TURN 中继";
-  else if (transportHint === "frp-udp") path = "FRP UDP";
-  else if (local?.candidateType === "host" && remote?.candidateType === "host") path = "局域网直连";
+  if (local?.candidateType === "relay" || remote?.candidateType === "relay") return "TURN 中继";
+  // 88FRP is a relay even if the browser sees host/srflx candidates.
+  if (transportHint === "frp-udp") return "88FRP UDP 中继";
+  const localHost = local?.candidateType === "host";
+  const remoteHost = remote?.candidateType === "host";
+  if (localHost && remoteHost) return isPrivateAddress(local.address) && isPrivateAddress(remote.address) ? "局域网直连" : "WebRTC 直连";
+  if (local?.candidateType === "srflx" || remote?.candidateType === "srflx") return "公网 P2P 直连";
+  return "WebRTC UDP";
+}
+
+function formatBitrate(bitsPerSecond) {
+  if (!Number.isFinite(bitsPerSecond) || bitsPerSecond <= 0) return "--";
+  return bitsPerSecond >= 1_000_000 ? `${(bitsPerSecond / 1_000_000).toFixed(1)} Mbps` : `${Math.round(bitsPerSecond / 1000)} Kbps`;
+}
+
+function recommendedProfile(loss, rtt, jitter, fps) {
+  if (loss > 5 || rtt > 350 || jitter > 80 || (fps > 0 && fps < 8)) return "smooth";
+  if (loss > 2 || rtt > 220 || jitter > 45 || (fps > 0 && fps < 16)) return "low";
+  if (loss > 0.8 || rtt > 120 || jitter > 25) return "standard";
+  return "hd";
+}
+
+function profileRank(profile) {
+  return ({ smooth: 0, low: 1, standard: 2, hd: 3, custom: 3, quality: 4, ultra: 5 })[profile] ?? 3;
+}
+
+function updateTransportIndicator(reports, pair, rtt) {
+  if (!pair) return;
+  const path = transportPathLabel(reports, pair);
   const delay = rtt > 0 ? ` · ${Math.round(rtt * 1000)}ms` : "";
   $("#latency-chip").textContent = path + delay;
-  // The browser sees the server candidate as "remote". A server srflx
-  // candidate is its real NAT mapping; the FRP UDP advertisement is a host
-  // candidate whose public port is rewritten before the answer is sent.
-  const diagnosticPath = usesTURN ? "TURN 中继" : remote?.candidateType === "srflx" ? "公网 UDP 直连" : transportHint === "frp-udp" ? "88FRP UDP 中继" : local?.candidateType === "host" && remote?.candidateType === "host" ? "局域网直连" : "WebRTC UDP";
-  $("#latency-chip").textContent = diagnosticPath + delay;
-  $("#diagnostic-path").textContent = diagnosticPath;
+  $("#diagnostic-path").textContent = path;
 }
 
 function renderTransferSpeed(reports) {
@@ -417,37 +517,138 @@ function renderTransferSpeed(reports) {
   }
   transportLastBytes = bytes;
   transportLastAt = now;
-  const label = bitsPerSecond >= 1_000_000
-    ? `${(bitsPerSecond / 1_000_000).toFixed(1)} Mbps`
-    : `${Math.round(bitsPerSecond / 1000)} Kbps`;
-  $("#mobile-transport").textContent = `传输 ${label}`;
+  const bitrateLabel = formatBitrate(bitsPerSecond);
+  $("#mobile-transport").textContent = `传输 ${bitrateLabel}`;
   const chip = $("#latency-chip");
-  chip.dataset.speed = label;
-  if (!chip.textContent.includes(label)) chip.textContent = `${chip.textContent.replace(/ · [\d.]+ (?:M|K)bps$/, "")} · ${label}`;
+  chip.dataset.speed = bitrateLabel;
+  if (bitrateLabel !== "--" && !chip.textContent.includes(bitrateLabel)) chip.textContent = `${chip.textContent.replace(/ · [\d.]+ (?:M|K)bps$/, "")} · ${bitrateLabel}`;
 
   const packets = Number(inbound.packetsReceived || 0);
   const lost = Math.max(0, Number(inbound.packetsLost || 0));
   const loss = packets + lost > 0 ? lost * 100 / (packets + lost) : 0;
   const jitter = Number(inbound.jitter || 0) * 1000;
   const decoded = Number(inbound.framesDecoded || 0);
+  const dropped = Number(inbound.framesDropped || 0);
+  const freezes = Number(inbound.freezeCount || 0);
   let fps = 0;
   if (diagnosticLast && now > diagnosticLast.at) fps = Math.max(0, (decoded - diagnosticLast.decoded) * 1000 / (now - diagnosticLast.at));
-  diagnosticLast = { at: now, decoded };
+  const droppedDelta = diagnosticLast ? Math.max(0, dropped - (diagnosticLast.dropped || 0)) : 0;
+  const freezeDelta = diagnosticLast ? Math.max(0, freezes - (diagnosticLast.freezes || 0)) : 0;
+  diagnosticLast = { at: now, decoded, dropped, freezes };
   const rtt = Number(reports.__phoneBridgeRTT || 0) * 1000;
   $("#diagnostic-rtt").textContent = rtt > 0 ? `${Math.round(rtt)}ms` : "--";
   $("#diagnostic-quality").textContent = `${Math.round(jitter)}ms / ${loss.toFixed(1)}%`;
-  $("#diagnostic-video").textContent = `${label} / ${fps.toFixed(0)}fps`;
+  $("#diagnostic-bitrate").textContent = bitrateLabel;
+  $("#diagnostic-resolution").textContent = inbound.frameWidth && inbound.frameHeight ? `${inbound.frameWidth} × ${inbound.frameHeight}` : "--";
+  $("#diagnostic-video").textContent = fps > 0 ? `${fps.toFixed(0)} fps` : "--";
+  $("#diagnostic-drops").textContent = `${droppedDelta} / ${freezeDelta}`;
+  $("#diagnostic-reconnect").textContent = lastReconnectReason ? `${reconnectAttempts} 次 · ${lastReconnectReason}` : "0 次";
+  networkHistory.push({ at: now, rtt, loss, bitrate: bitsPerSecond, fps });
+  if (networkHistory.length > 60) networkHistory.shift();
+  drawNetworkSparkline();
   const warning = loss > 3 || rtt > 260 || jitter > 45 || (decoded > 5 && fps > 0 && fps < 8);
-  $("#network-summary").textContent = warning ? "网络波动" : "传输正常";
+  const bad = loss > 8 || rtt > 500 || (decoded > 5 && fps > 0 && fps < 4);
+  networkState = bad ? "bad" : warning ? "warning" : "ok";
+  $("#network-summary").textContent = bad ? "网络较差" : warning ? "网络波动" : "传输正常";
+  $("#network-summary").dataset.state = networkState;
+  const suggested = recommendedProfile(loss, rtt, jitter, fps);
+  networkRecommendation = profileRank(suggested) < profileRank(selectedProfile) ? suggested : null;
+  $("#network-recommendation-text").textContent = networkRecommendation ? `建议 ${profileLabel(networkRecommendation)}` : "当前档位与网络匹配";
+  $("#apply-network-recommendation").disabled = !networkRecommendation;
   $("#network-advice").textContent = warning
-    ? "检测到弱网。画质不会自动变化；可点击“流畅”切到 360p / 10fps，或在顶部手动选择档位。"
-    : "当前为实时测量结果；显示“公网 UDP 直连”才表示浏览器未经过 88FRP 视频中继。";
+    ? "检测到弱网。画质不会自动变化；可应用建议档位或手动选择。"
+    : "指标每秒刷新；画质保持手动控制。";
+}
+
+function drawNetworkSparkline() {
+  const canvas = $("#network-sparkline");
+  if (!canvas) return;
+  const context = canvas.getContext("2d");
+  if (!context) return;
+  const width = canvas.width;
+  const height = canvas.height;
+  context.clearRect(0, 0, width, height);
+  context.strokeStyle = "rgba(126,157,211,.16)";
+  context.lineWidth = 1;
+  for (let y = 12; y < height; y += 24) {
+    context.beginPath();
+    context.moveTo(0, y);
+    context.lineTo(width, y);
+    context.stroke();
+  }
+  if (networkHistory.length < 2) return;
+  const maxRTT = Math.max(400, ...networkHistory.map((item) => item.rtt));
+  const maxBitrate = Math.max(1_000_000, ...networkHistory.map((item) => item.bitrate));
+  const x = (index) => index * width / Math.max(1, networkHistory.length - 1);
+  context.strokeStyle = "#5e9bff";
+  context.lineWidth = 2;
+  context.beginPath();
+  networkHistory.forEach((item, index) => {
+    const y = height - 10 - Math.min(1, item.rtt / maxRTT) * (height - 20);
+    if (index === 0) context.moveTo(x(index), y);
+    else context.lineTo(x(index), y);
+  });
+  context.stroke();
+  context.strokeStyle = "rgba(125,224,176,.8)";
+  context.lineWidth = 1.5;
+  context.beginPath();
+  networkHistory.forEach((item, index) => {
+    const y = height - 10 - Math.min(1, item.bitrate / maxBitrate) * (height - 20);
+    if (index === 0) context.moveTo(x(index), y);
+    else context.lineTo(x(index), y);
+  });
+  context.stroke();
+}
+
+async function applyNetworkRecommendation() {
+  if (!networkRecommendation || !joined) return;
+  const profile = networkRecommendation;
+  networkRecommendation = null;
+  $("#apply-network-recommendation").disabled = true;
+  await applyStreamProfile(profile, false);
+  $("#network-recommendation-text").textContent = `已切换到 ${profileLabel(profile)}`;
+}
+
+async function copyNetworkDiagnostics() {
+  const lines = [
+    "PhoneBridge 网络诊断",
+    `路径: ${$("#diagnostic-path").textContent}`,
+    `RTT: ${$("#diagnostic-rtt").textContent}`,
+    `抖动/丢包: ${$("#diagnostic-quality").textContent}`,
+    `接收码率: ${$("#diagnostic-bitrate").textContent}`,
+    `分辨率: ${$("#diagnostic-resolution").textContent}`,
+    `解码帧率: ${$("#diagnostic-video").textContent}`,
+    `丢帧/冻结: ${$("#diagnostic-drops").textContent}`,
+    `重连: ${$("#diagnostic-reconnect").textContent}`,
+    `状态: ${$("#network-summary").textContent}`,
+    `传输提示: ${transportStatus?.reason || "未知"}`,
+  ];
+  try {
+    await navigator.clipboard.writeText(lines.join("\n"));
+    showToast("诊断信息已复制");
+  } catch {
+    showToast("复制失败，请手动选择诊断文本", true);
+  }
+}
+
+function resetNetworkStats() {
+  networkHistory = [];
+  networkRecommendation = null;
+  diagnosticLast = null;
+  const fields = ["#diagnostic-rtt", "#diagnostic-quality", "#diagnostic-bitrate", "#diagnostic-resolution", "#diagnostic-video", "#diagnostic-drops", "#diagnostic-reconnect"];
+  fields.forEach((selector) => { const element = $(selector); if (element) element.textContent = "--"; });
+  const recommendation = $("#network-recommendation-text");
+  if (recommendation) recommendation.textContent = "等待实时数据";
+  const button = $("#apply-network-recommendation");
+  if (button) button.disabled = true;
+  drawNetworkSparkline();
 }
 
 function startTransportMonitor() {
   clearInterval(transportMonitorTimer);
   transportLastBytes = null;
   transportLastAt = null;
+  resetNetworkStats();
   transportMonitorTimer = setInterval(async () => {
     if (!joined || !peerConnection) return;
     const reports = await peerConnection.getStats().catch(() => null);
@@ -472,7 +673,7 @@ function stopTransportMonitor() {
 }
 
 function scheduleWebRTCRecovery(immediate = false) {
-  if (!joined || session?.isDemo) return;
+  if (!joined || takeoverBlocked || session?.isDemo) return;
   if (webRTCStarting) {
     // The current negotiation round is still winding down (for example an
     // offer request that has not returned yet). Mark recovery as pending; the
@@ -634,20 +835,14 @@ function updateCountdown() {
 function updateDiagnostics(state) {
   const summary = $("#network-summary");
   const path = $("#diagnostic-path");
-  const rtt = $("#diagnostic-rtt");
-  const quality = $("#diagnostic-quality");
-  const video = $("#diagnostic-video");
   const advice = $("#network-advice");
-  const clearStats = () => {
-    rtt.textContent = "--";
-    quality.textContent = "--";
-    video.textContent = "--";
-  };
+  const clearStats = () => resetNetworkStats();
   switch (state) {
     case "negotiating":
       path.textContent = "正在协商 WebRTC";
       clearStats();
       summary.textContent = "正在协商…";
+      summary.dataset.state = "connecting";
       advice.textContent = transportStatus?.udpForwardActive
         ? (transportStatus.udpForwardFresh ? "已启用 88FRP 公网 UDP 映射，等待首帧。" : "使用已恢复的 88FRP UDP 映射，等待首帧。")
         : transportStatus?.turnConfigured
@@ -658,18 +853,24 @@ function updateDiagnostics(state) {
       path.textContent = "正在恢复连接";
       clearStats();
       summary.textContent = "正在重连";
+      summary.dataset.state = "warning";
+      if (!lastReconnectReason) lastReconnectReason = "WebRTC 链路中断";
       advice.textContent = "实时链路中断，正在有界自动恢复；若恢复失败将进入兼容画面。";
       break;
     case "compatibility":
       path.textContent = "兼容画面模式";
       clearStats();
       summary.textContent = "兼容预览";
+      summary.dataset.state = "warning";
+      lastReconnectReason = "已切换兼容画面";
       advice.textContent = "当前通过 HTTP 兼容通道显示画面，控制仍保持实时。可点击“低延迟视频”尝试恢复 WebRTC。";
       break;
     case "cooldown":
       path.textContent = "低延迟视频冷却中";
       clearStats();
       summary.textContent = "自动重试已停止";
+      summary.dataset.state = "bad";
+      lastReconnectReason = "自动重试已停止";
       advice.textContent = "为避免重连风暴已停止自动协商。稍候或点击“低延迟视频”手动重试。";
       break;
   }
@@ -685,6 +886,7 @@ function showReconnect() {
   $("#stage-message-detail").textContent = "请保持页面打开";
   $("#stage-message").classList.remove("hidden");
   $("#connection-chip").innerHTML = "<i class=\"warning\"></i>正在重连";
+  if (!lastReconnectReason) lastReconnectReason = "WebRTC 链路中断";
   updateDiagnostics("reconnecting");
 }
 
@@ -781,6 +983,7 @@ function prioritizeNativeVideo() {
 }
 
 async function startWebRTC(recovery = false) {
+  if (takeoverBlocked) return;
   if (webRTCStarting) return;
   webRTCStarting = true;
   recoveryPending = false;
@@ -887,8 +1090,8 @@ async function startWebRTC(recovery = false) {
     });
     if (peerConnection === connection) await connection.setRemoteDescription(answer);
   } catch (error) {
-    if (error.status === 409) {
-      endSession("此连接已被新的设备接管");
+    if (isControlTakenOver(error)) {
+      showTakeover(error.payload);
       return;
     }
     if (error.status === 404 || error.status === 410) {
@@ -984,6 +1187,10 @@ function endSession(message) {
   clearTimeout(fallbackRetryTimer);
   cleanupWebRTC();
   stopFallbackFrames();
+  hideTakeover();
+  try {
+    sessionStorage.removeItem(viewerStorageKey);
+  } catch {}
   joined = false;
   $("#controller-shell").classList.add("hidden");
   $("#join-page").classList.remove("hidden");
@@ -1047,6 +1254,10 @@ document.addEventListener("DOMContentLoaded", () => {
       useCompatibilityPreview();
     }
   });
+  $("#takeover-exit")?.addEventListener("click", () => endSession("控制权已转移"));
+  $("#takeover-reclaim")?.addEventListener("click", reclaimControl);
+  $("#apply-network-recommendation")?.addEventListener("click", applyNetworkRecommendation);
+  $("#copy-network-diagnostics")?.addEventListener("click", copyNetworkDiagnostics);
   setupPhoneInput();
   setupButtons();
   loadSession();
