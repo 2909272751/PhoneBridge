@@ -187,8 +187,11 @@
                 <label>PhoneBridge 隧道<select id="frp-tunnel"><option value="">自动筛选本地端口 8787</option></select></label>
               </div>
               <label class="scheme-picker">分享协议<select id="frp-scheme"><option value="http">http</option><option value="https">https</option></select></label>
+              <label class="checkbox-line"><input id="frp-use-bound-domain" type="checkbox">使用 88FRP 绑定域名作为分享地址</label>
+              <p class="field-hint" id="frp-domain-status">开启后会读取 88FRP「域名绑定」中的 A 记录；节点 IP 变化时分享主机名保持不变，远程端口仍需保留。</p>
+              <p class="field-hint">快速模式创建的隧道使用自动分配远程端口：普通重连不会换端口，但切换节点或重建隧道可能重新分配，届时需要重新生成分享链接。</p>
               <label class="checkbox-line"><input id="frp-auto-sync" type="checkbox" checked>每 15 秒同步一次最新地址</label>
-              <p class="field-hint">登录成功后自动同步已选 TCP 隧道与 3478 端口的 UDP 映射，并刷新低延迟视频链路；未选隧道时先返回实例列表。</p>
+              <p class="field-hint">登录成功后自动同步已选 TCP 隧道与 3478 端口的 UDP 映射；节点变化时会刷新低延迟视频链路。</p>
             </div>
             <div class="access-actions">
               <button class="button secondary" id="sync-public-access" type="button">同步地址</button>

@@ -170,6 +170,7 @@ function renderPublicAccess(access) {
   $("#manual-public-url").value = settings.manualUrl || "";
   $("#frp-service-url").value = settings.frpServiceUrl || "http://127.0.0.1:8801";
   $("#frp-scheme").value = settings.frpScheme === "https" ? "https" : "http";
+  $("#frp-use-bound-domain").checked = Boolean(settings.frpUseBoundDomain);
   $("#frp-auto-sync").checked = Boolean(settings.autoSync);
   $("#manual-public-fields").classList.toggle("hidden", source !== "manual");
   $("#frp-public-fields").classList.toggle("hidden", source !== "88frp");
@@ -194,6 +195,21 @@ function renderPublicAccess(access) {
   const suffix = access.effectiveUrl ? ` 当前地址：${access.effectiveUrl}` : "";
   $("#public-access-message").textContent = `${access.message || "尚未设置公网地址。"}${suffix}`;
   $("#public-access-message").classList.toggle("error", access.state === "frp-error" || access.state === "frp-unreachable");
+  const domainElement = $("#frp-domain-status");
+  if (domainElement) {
+    const domain = access.frpDomain;
+    if (!settings.frpUseBoundDomain) {
+      domainElement.textContent = "未启用绑定域名；分享地址会继续使用 88FRP 节点 IP。";
+      domainElement.classList.remove("error");
+    } else if (!domain) {
+      domainElement.textContent = "等待 88FRP 域名绑定状态；同步前暂时使用节点 IP。";
+      domainElement.classList.remove("error");
+    } else {
+      const target = domain.fqdn ? `${domain.fqdn}${domain.aTarget ? ` → ${domain.aTarget}` : ""}` : "";
+      domainElement.textContent = [target, domain.message].filter(Boolean).join(" · ");
+      domainElement.classList.toggle("error", !["ready", "pending"].includes(domain.state));
+    }
+  }
 }
 
 // base64urlFromArray encodes bytes as RFC 4648 base64url without padding.
@@ -608,6 +624,7 @@ function collectPublicAccessSettings() {
     frpInstanceId: $("#frp-instance").value,
     frpTunnelName: $("#frp-tunnel").value,
     frpScheme: $("#frp-scheme").value,
+    frpUseBoundDomain: $("#frp-use-bound-domain").checked,
     autoSync: $("#frp-auto-sync").checked,
   };
 }

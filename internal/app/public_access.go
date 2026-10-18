@@ -35,6 +35,7 @@ type PublicAccessSettings struct {
 	FRPInstanceID     string `json:"frpInstanceId"`
 	FRPTunnelName     string `json:"frpTunnelName"`
 	FRPScheme         string `json:"frpScheme"`
+	FRPUseBoundDomain bool   `json:"frpUseBoundDomain"`
 	AutoSync          bool   `json:"autoSync"`
 	FRPLastSuccessURL string `json:"frpLastSuccessUrl,omitempty"`
 	// FRPUDPForward is the last successfully discovered 88FRP UDP mapping for
@@ -51,6 +52,45 @@ type PublicAccessSnapshot struct {
 	LastSyncedAt *time.Time           `json:"lastSyncedAt,omitempty"`
 	Instances    []FRPInstance        `json:"instances,omitempty"`
 	Tunnels      []FRPTunnel          `json:"tunnels,omitempty"`
+	FRPDomain    *BoundDomainStatus   `json:"frpDomain,omitempty"`
+}
+
+// BoundDomainStatus is the non-secret 88FRP domain-binding state shown to the
+// operator. The Cloudflare token and 88FRP cookies remain owned by 88FRP; this
+// struct only mirrors what the local management API reported.
+type BoundDomainStatus struct {
+	Enabled    bool       `json:"enabled"`
+	FQDN       string     `json:"fqdn,omitempty"`
+	ATarget    string     `json:"aTarget,omitempty"`
+	NodeAddr   string     `json:"nodeAddr,omitempty"`
+	State      string     `json:"state"`
+	Message    string     `json:"message,omitempty"`
+	LastSyncAt *time.Time `json:"lastSyncAt,omitempty"`
+}
+
+type frpDomainBinding struct {
+	Config struct {
+		Enabled              bool   `json:"enabled"`
+		Zone                 string `json:"zone"`
+		CanWrite             bool   `json:"canWrite"`
+		AutoFollow           bool   `json:"autoFollow"`
+		CheckIntervalSeconds int    `json:"checkIntervalSeconds"`
+		TTL                  int    `json:"ttl"`
+		Hostname             string `json:"hostname"`
+	} `json:"config"`
+	HasToken bool `json:"hasToken"`
+	Record   *struct {
+		FQDN    string `json:"fqdn"`
+		Type    string `json:"type"`
+		Content string `json:"content"`
+		TTL     int    `json:"ttl"`
+		Proxied bool   `json:"proxied"`
+	} `json:"record"`
+	NodeAddr   string     `json:"nodeAddr"`
+	AutoStatus string     `json:"autoStatus"`
+	LastError  string     `json:"lastError"`
+	LastSyncAt *time.Time `json:"lastSyncAt"`
+	Error      string     `json:"error"`
 }
 
 type FRPInstance struct {
@@ -232,6 +272,10 @@ func (manager *PublicAccessManager) load(initialURL string) error {
 	} else if settings.Source == publicAccess88FRP && settings.FRPLastSuccessURL != "" {
 		if value, err := normalizePublicURL(settings.FRPLastSuccessURL); err == nil {
 			manager.snapshot.EffectiveURL = value
+			// Do not flash a configured 88FRP share as local-only during the
+			// restart window before automatic sign-in and the first Sync finish.
+			manager.snapshot.State = "frp-stale-ready"
+			manager.snapshot.Message = "已恢复上次成功的公网地址，正在重新同步 88FRP。"
 		}
 	}
 	// Persist once so the local probe ID (and any restored last-success URL)
@@ -296,6 +340,10 @@ func (manager *PublicAccessManager) Snapshot() PublicAccessSnapshot {
 func clonePublicAccessSnapshot(value PublicAccessSnapshot) PublicAccessSnapshot {
 	value.Instances = append([]FRPInstance(nil), value.Instances...)
 	value.Tunnels = append([]FRPTunnel(nil), value.Tunnels...)
+	if value.FRPDomain != nil {
+		copy := *value.FRPDomain
+		value.FRPDomain = &copy
+	}
 	return value
 }
 
@@ -633,10 +681,19 @@ func (manager *PublicAccessManager) Sync(ctx context.Context) (PublicAccessSnaps
 		manager.setSyncError(settings, instances, tunnels, err)
 		return manager.Snapshot(), err
 	}
-	host, err := frpServerHost(configText)
+	ipHost, err := frpServerHost(configText)
 	if err != nil {
 		manager.setSyncError(settings, instances, tunnels, err)
 		return manager.Snapshot(), err
+	}
+	host := ipHost
+	var domainStatus *BoundDomainStatus
+	if settings.FRPUseBoundDomain {
+		boundHost, status := manager.domainPublicHost(ctx, serviceURL, settings.FRPInstanceID)
+		domainStatus = status
+		if boundHost != "" {
+			host = boundHost
+		}
 	}
 	remotePort := portFromValue(chosen.RemotePort)
 	if remotePort < 1 || remotePort > 65535 {
@@ -660,7 +717,11 @@ func (manager *PublicAccessManager) Sync(ctx context.Context) (PublicAccessSnaps
 	settings = manager.snapshot.Settings
 	manager.mu.RUnlock()
 	now := time.Now()
-	manager.setSnapshot(PublicAccessSnapshot{Settings: settings, EffectiveURL: publicURL, State: "frp-ready", Message: fmt.Sprintf("已从 88FRP 同步：%s", publicURL), LastSyncedAt: &now, Instances: instances, Tunnels: tunnels})
+	message := fmt.Sprintf("已从 88FRP 同步：%s", publicURL)
+	if domainStatus != nil && domainStatus.State != "" && domainStatus.State != "ready" && domainStatus.Message != "" {
+		message += "；" + domainStatus.Message
+	}
+	manager.setSnapshot(PublicAccessSnapshot{Settings: settings, EffectiveURL: publicURL, State: "frp-ready", Message: message, LastSyncedAt: &now, Instances: instances, Tunnels: tunnels, FRPDomain: domainStatus})
 	return manager.Snapshot(), nil
 }
 
@@ -672,7 +733,7 @@ func (manager *PublicAccessManager) setSnapshot(snapshot PublicAccessSnapshot) {
 
 func (manager *PublicAccessManager) setSyncError(settings PublicAccessSettings, instances []FRPInstance, tunnels []FRPTunnel, err error) {
 	current := manager.Snapshot()
-	manager.setSnapshot(PublicAccessSnapshot{Settings: settings, EffectiveURL: current.EffectiveURL, State: "frp-error", Message: "88FRP 同步失败：" + err.Error(), LastSyncedAt: current.LastSyncedAt, Instances: instances, Tunnels: tunnels})
+	manager.setSnapshot(PublicAccessSnapshot{Settings: settings, EffectiveURL: current.EffectiveURL, State: "frp-error", Message: "88FRP 同步失败：" + err.Error(), LastSyncedAt: current.LastSyncedAt, Instances: instances, Tunnels: tunnels, FRPDomain: current.FRPDomain})
 }
 
 func (manager *PublicAccessManager) ProbeID() string {
@@ -692,14 +753,14 @@ func (manager *PublicAccessManager) syncFailed(settings PublicAccessSettings, in
 		oldURL = strings.TrimSpace(current.EffectiveURL)
 	}
 	if oldURL == "" {
-		manager.setSnapshot(PublicAccessSnapshot{Settings: settings, State: "frp-error", Message: "88FRP 同步失败：" + err.Error(), LastSyncedAt: current.LastSyncedAt, Instances: instances, Tunnels: tunnels})
+		manager.setSnapshot(PublicAccessSnapshot{Settings: settings, State: "frp-error", Message: "88FRP 同步失败：" + err.Error(), LastSyncedAt: current.LastSyncedAt, Instances: instances, Tunnels: tunnels, FRPDomain: current.FRPDomain})
 		return
 	}
 	if manager.verifyPublicHealth(context.Background(), oldURL) {
-		manager.setSnapshot(PublicAccessSnapshot{Settings: settings, EffectiveURL: oldURL, State: "frp-stale-ready", Message: fmt.Sprintf("公网可用，但 88FRP 自动同步需重新登录/暂时失败：%v。仍继续使用 %s。", err, oldURL), LastSyncedAt: current.LastSyncedAt, Instances: instances, Tunnels: tunnels})
+		manager.setSnapshot(PublicAccessSnapshot{Settings: settings, EffectiveURL: oldURL, State: "frp-stale-ready", Message: fmt.Sprintf("公网可用，但 88FRP 自动同步需重新登录/暂时失败：%v。仍继续使用 %s。", err, oldURL), LastSyncedAt: current.LastSyncedAt, Instances: instances, Tunnels: tunnels, FRPDomain: current.FRPDomain})
 		return
 	}
-	manager.setSnapshot(PublicAccessSnapshot{Settings: settings, EffectiveURL: oldURL, State: "frp-unreachable", Message: fmt.Sprintf("无法确认公网地址 %s 仍指向本机：%v。该地址保留供诊断，但当前不能宣称公网可用。", oldURL, err), LastSyncedAt: current.LastSyncedAt, Instances: instances, Tunnels: tunnels})
+	manager.setSnapshot(PublicAccessSnapshot{Settings: settings, EffectiveURL: oldURL, State: "frp-unreachable", Message: fmt.Sprintf("无法确认公网地址 %s 仍指向本机：%v。该地址保留供诊断，但当前不能宣称公网可用。", oldURL, err), LastSyncedAt: current.LastSyncedAt, Instances: instances, Tunnels: tunnels, FRPDomain: current.FRPDomain})
 }
 
 // verifyPublicHealth asks the public URL's lightweight health endpoint and
@@ -809,6 +870,80 @@ func (manager *PublicAccessManager) fetchInstance(ctx context.Context, serviceUR
 		return nil, "", err
 	}
 	return tunnelData.Tunnels, configData.ConfigText, nil
+}
+
+// fetchDomainBinding reads the 88FRP domain-binding status through the same
+// authenticated local management session used for instances and tunnels. The
+// response contains no Cloudflare token; only the derived A record and node
+// address are consumed here.
+func (manager *PublicAccessManager) fetchDomainBinding(ctx context.Context, serviceURL, instanceID string) (*frpDomainBinding, error) {
+	escapedID := url.PathEscape(instanceID)
+	var binding frpDomainBinding
+	if err := manager.getJSON(ctx, serviceURL+"/api/instances/"+escapedID+"/domain-binding", &binding); err != nil {
+		return nil, err
+	}
+	return &binding, nil
+}
+
+// domainPublicHost returns the stable host from 88FRP's bound domain and a
+// non-secret status for the settings page. It falls back to the caller's
+// serverAddr when the binding is disabled, has no record, or cannot be read.
+func (manager *PublicAccessManager) domainPublicHost(ctx context.Context, serviceURL, instanceID string) (string, *BoundDomainStatus) {
+	binding, err := manager.fetchDomainBinding(ctx, serviceURL, instanceID)
+	if err != nil {
+		manager.invalidateFRPSessionForError(err)
+		return "", &BoundDomainStatus{State: "error", Message: "读取 88FRP 域名绑定失败：" + err.Error()}
+	}
+	status := &BoundDomainStatus{
+		Enabled:    binding.Config.Enabled,
+		NodeAddr:   strings.TrimSpace(binding.NodeAddr),
+		LastSyncAt: binding.LastSyncAt,
+	}
+	if !binding.Config.Enabled {
+		status.State = "disabled"
+		status.Message = "88FRP 域名绑定未启用，继续使用节点 IP。"
+		return "", status
+	}
+	if binding.Record == nil {
+		status.State = "no-record"
+		status.Message = "88FRP 还没有发布 A 记录，继续使用节点 IP。"
+		return "", status
+	}
+	if binding.Error != "" {
+		status.State = "error"
+		status.Message = binding.Error
+	}
+	host, err := normalizeBoundDomain(binding.Record.FQDN)
+	if err != nil {
+		status.State = "invalid"
+		status.Message = "88FRP 返回的绑定域名无效，继续使用节点 IP：" + err.Error()
+		return "", status
+	}
+	status.FQDN = host
+	status.ATarget = strings.TrimSpace(binding.Record.Content)
+	switch {
+	case binding.LastError != "":
+		status.State = "warning"
+		status.Message = "88FRP 域名自动跟随有警告，但仍使用绑定域名：" + binding.LastError
+	case status.NodeAddr != "" && status.ATarget != "" && !strings.EqualFold(status.NodeAddr, status.ATarget):
+		status.State = "pending"
+		status.Message = fmt.Sprintf("88FRP 正在把 %s 指向当前节点（当前记录 %s，节点 %s）。", host, status.ATarget, status.NodeAddr)
+	default:
+		status.State = "ready"
+		status.Message = "域名解析已指向当前节点。"
+	}
+	return host, status
+}
+
+func normalizeBoundDomain(value string) (string, error) {
+	host := strings.TrimSuffix(strings.TrimSpace(value), ".")
+	if host == "" {
+		return "", errors.New("域名为空")
+	}
+	if strings.ContainsAny(host, "/:@?# \t\r\n") {
+		return "", fmt.Errorf("域名格式无效：%q", value)
+	}
+	return host, nil
 }
 
 func (manager *PublicAccessManager) getJSON(ctx context.Context, address string, target any) error {

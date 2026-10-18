@@ -26,7 +26,7 @@ import (
 //go:embed web/*
 var embeddedWeb embed.FS
 
-const version = "2.1.2"
+const version = "2.2.0"
 
 // defaultICEPort is the local UDP port PhoneBridge binds for WebRTC when
 // Config.ICEPort is left at its zero value. It is also the port 88FRP UDP
@@ -237,27 +237,30 @@ func (server *Server) ensurePublicICE(ctx context.Context) {
 // advertiseUDPForwardLocked refreshes the advertised 88FRP UDP mapping.
 // Callers must hold iceMu. It prefers a fresh authenticated discovery and
 // falls back to the persisted mapping (marked recovered) when the 88FRP
-// management API is unavailable. Once a mapping is advertised the discovery
-// loop stops retrying.
+// management API is unavailable. It deliberately runs on every refresh: 88FRP
+// can move a subscription to another node, and a stale public UDP endpoint
+// would make the page open while WebRTC stays stuck on an old IP.
 func (server *Server) advertiseUDPForwardLocked(ctx context.Context) {
-	if server.icePublicPort != 0 {
-		return
-	}
 	port := server.iceLocalPortLocked()
 	host, publicPort, fresh, err := server.publicAccess.DiscoverUDPForward(ctx, port)
 	if err != nil {
 		server.logger.Printf("WebRTC public UDP mapping unavailable: %v", err)
 		return
 	}
+	changed := server.icePublicHost != host || server.icePublicPort != publicPort
 	server.icePublicHost = host
 	server.icePublicPort = publicPort
 	server.iceUDPFresh = fresh
-	server.rebuildWebRTCAPILocked()
+	if changed || server.webRTCAPI == nil {
+		server.rebuildWebRTCAPILocked()
+	}
 	label := "recovered"
 	if fresh {
 		label = "fresh"
 	}
-	server.logger.Printf("WebRTC UDP mapped through 88FRP (%s): %s:%d -> 127.0.0.1:%d", label, host, publicPort, port)
+	if changed {
+		server.logger.Printf("WebRTC UDP mapped through 88FRP (%s): %s:%d -> 127.0.0.1:%d", label, host, publicPort, port)
+	}
 }
 
 // rebuildWebRTCAPILocked recreates the pion API so the bound UDP mux and the
@@ -271,8 +274,9 @@ func (server *Server) rebuildWebRTCAPILocked() {
 	server.webRTCAPI = pion.NewAPI(pion.WithSettingEngine(engine))
 }
 
-// udpDiscoveryLoop retries 88FRP UDP discovery at a low frequency while no
-// mapping is advertised, then stops once WebRTC UDP is enabled.
+// udpDiscoveryLoop refreshes the 88FRP UDP discovery at a low frequency. It
+// must keep running after the first success because the 88FRP subscription can
+// move to a different node while PhoneBridge stays up.
 func (server *Server) udpDiscoveryLoop(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -281,9 +285,6 @@ func (server *Server) udpDiscoveryLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if server.iceUDPEnabled() {
-				return
-			}
 			server.ensurePublicICE(ctx)
 		}
 	}

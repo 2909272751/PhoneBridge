@@ -195,6 +195,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .frp-remember-line { margin-top: 2px; }
 .remember-hint { color: var(--muted); font-size: 10px; font-weight: 400; line-height: 1.5; }
 .field-hint, .access-message { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.6; }
+.field-hint.error { color: var(--red); }
 .field-hint code { padding: 2px 4px; border-radius: 4px; background: #eaf0fa; color: #54627a; }
 .access-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 16px; }
 .access-message { margin-top: 13px; }

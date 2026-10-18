@@ -69,6 +69,95 @@ func TestPublicAccessSyncs88FRPAddress(t *testing.T) {
 	}
 }
 
+func TestPublicAccessSyncUsesBoundDomain(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		var data any
+		switch request.URL.Path {
+		case "/api/instances":
+			data = []map[string]any{{"id": "home", "name": "Home"}}
+		case "/api/instances/home/tunnels":
+			data = map[string]any{"tunnels": []map[string]any{{"name": "phonebridge", "type": "tcp", "localPort": 8787, "remotePort": 19080, "enabled": true}}}
+		case "/api/instances/home/config":
+			data = map[string]any{"configText": "serverAddr = \"198.51.100.7\"\nserverPort = 7000\n"}
+		case "/api/instances/home/domain-binding":
+			data = map[string]any{
+				"config":     map[string]any{"enabled": true, "zone": "example.test", "canWrite": true, "autoFollow": true, "checkIntervalSeconds": 5, "ttl": 60, "hostname": "@"},
+				"hasToken":   true,
+				"record":     map[string]any{"fqdn": "share.example.test", "type": "A", "content": "198.51.100.7", "ttl": 60, "proxied": false},
+				"nodeAddr":   "198.51.100.7",
+				"autoStatus": "自动跟随中 · 每 5 秒检查",
+			}
+		default:
+			http.NotFound(writer, request)
+			return
+		}
+		_ = json.NewEncoder(writer).Encode(map[string]any{"success": true, "data": data})
+	}))
+	defer server.Close()
+
+	manager := NewPublicAccessManager(filepath.Join(t.TempDir(), "settings.json"), "", 8787, nil)
+	snapshot, err := manager.Save(context.Background(), PublicAccessSettings{
+		Source:            publicAccess88FRP,
+		FRPServiceURL:     server.URL,
+		FRPInstanceID:     "home",
+		FRPTunnelName:     "phonebridge",
+		FRPScheme:         "https",
+		FRPUseBoundDomain: true,
+		AutoSync:          true,
+	})
+	if err != nil {
+		t.Fatalf("sync 88FRP with bound domain: %v", err)
+	}
+	if snapshot.EffectiveURL != "https://share.example.test:19080" {
+		t.Fatalf("bound domain was not used in the share origin: %#v", snapshot)
+	}
+	if snapshot.FRPDomain == nil || snapshot.FRPDomain.State != "ready" || snapshot.FRPDomain.FQDN != "share.example.test" {
+		t.Fatalf("bound domain status is wrong: %#v", snapshot.FRPDomain)
+	}
+}
+
+func TestPublicAccessBoundDomainFallsBackWithoutRecord(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		var data any
+		switch request.URL.Path {
+		case "/api/instances":
+			data = []map[string]any{{"id": "home", "name": "Home"}}
+		case "/api/instances/home/tunnels":
+			data = map[string]any{"tunnels": []map[string]any{{"name": "phonebridge", "type": "tcp", "localPort": 8787, "remotePort": 19080, "enabled": true}}}
+		case "/api/instances/home/config":
+			data = map[string]any{"configText": "serverAddr = \"198.51.100.7\"\n"}
+		case "/api/instances/home/domain-binding":
+			data = map[string]any{"config": map[string]any{"enabled": true, "zone": "example.test"}, "record": nil, "nodeAddr": "198.51.100.7"}
+		default:
+			http.NotFound(writer, request)
+			return
+		}
+		_ = json.NewEncoder(writer).Encode(map[string]any{"success": true, "data": data})
+	}))
+	defer server.Close()
+
+	manager := NewPublicAccessManager(filepath.Join(t.TempDir(), "settings.json"), "", 8787, nil)
+	snapshot, err := manager.Save(context.Background(), PublicAccessSettings{
+		Source:            publicAccess88FRP,
+		FRPServiceURL:     server.URL,
+		FRPInstanceID:     "home",
+		FRPTunnelName:     "phonebridge",
+		FRPScheme:         "http",
+		FRPUseBoundDomain: true,
+	})
+	if err != nil {
+		t.Fatalf("sync 88FRP without a domain record: %v", err)
+	}
+	if snapshot.EffectiveURL != "http://198.51.100.7:19080" {
+		t.Fatalf("fallback should use the node address: %#v", snapshot)
+	}
+	if snapshot.FRPDomain == nil || snapshot.FRPDomain.State != "no-record" {
+		t.Fatalf("missing domain record should be reported: %#v", snapshot.FRPDomain)
+	}
+}
+
 func writeSettingsFile(t *testing.T, settings PublicAccessSettings, probeID string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "settings.json")
@@ -146,6 +235,10 @@ func TestPublicAccessRestoresLastSuccessURL(t *testing.T) {
 	manager := NewPublicAccessManager(path, "", 8787, nil)
 	if manager.EffectiveURL() != "https://198.51.100.7:19080" {
 		t.Fatalf("last successful URL was not restored: %q", manager.EffectiveURL())
+	}
+	snapshot := manager.Snapshot()
+	if snapshot.State != "frp-stale-ready" || !strings.Contains(snapshot.Message, "正在重新同步") {
+		t.Fatalf("restored public address should not look local-only: %#v", snapshot)
 	}
 	if manager.ProbeID() != probe {
 		t.Fatalf("local probe ID was not restored: got %q want %q", manager.ProbeID(), probe)
